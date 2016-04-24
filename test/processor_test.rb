@@ -257,4 +257,23 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(0, @redis.llen("operators:queue"))
     assert_equal(false, @redis.exists("operators:known"))
   end
+
+  test "should dispatch events posted during dispatching" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = Processor.new(wrapper).dispatcher
+
+    redis_aux = Redis.new(db: 15)
+    wrapper.after(:sadd) do |*args|
+      # post an event from another instance while dispatching first batch
+      # (operator_id = 10)
+      redis_aux.lpush("events:queue", { 'id' => 2 }.to_json) if args[1] == '10'
+    end
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+    dispatcher.dispatch_all { |event| [event['id'] * 10, event['id'] * 100] }
+
+    assert_equal(2, @redis.llen("operators:queue"))
+    assert_equal("10", @redis.rpop("operators:queue"))
+    assert_equal("20", @redis.rpop("operators:queue"))
+  end
 end

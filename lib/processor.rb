@@ -16,29 +16,31 @@ EOS
     end
 
     def dispatch_all
-      @redis.rename("events:queue", "events:dispatching")
+      while @redis.exists("events:queue") do
+        @redis.rename("events:queue", "events:dispatching")
 
-      cnt = @redis.llen("events:dispatching")
-      arr = (1..cnt).map do |i|
-        json = @redis.lindex("events:dispatching", -i)
-        data = JSON.parse(json)
-        operator_id, installation_id = yield(data)
-        [operator_id, installation_id, data]
-      end
-
-      @redis.multi do
-        seen = []
-        arr.each do |(operator_id, installation_id, data)|
-          op_str = operator_id.to_s
-
-          @redis.sadd("operators:known", op_str)
-          @redis.lpush("operators:queue", op_str) unless seen.include?(op_str)
-          seen << op_str
-
-          @redis.lpush("operator:#{op_str}:events",
-            { 'installation_id' => installation_id, 'data' => data }.to_json)
+        cnt = @redis.llen("events:dispatching")
+        arr = (1..cnt).map do |i|
+          json = @redis.lindex("events:dispatching", -i)
+          data = JSON.parse(json)
+          operator_id, installation_id = yield(data)
+          [operator_id, installation_id, data]
         end
-        @redis.del("events:dispatching")
+
+        @redis.multi do
+          seen = []
+          arr.each do |(operator_id, installation_id, data)|
+            op_str = operator_id.to_s
+
+            @redis.sadd("operators:known", op_str)
+            @redis.lpush("operators:queue", op_str) unless seen.include?(op_str)
+            seen << op_str
+
+            @redis.lpush("operator:#{op_str}:events",
+              { 'installation_id' => installation_id, 'data' => data }.to_json)
+          end
+          @redis.del("events:dispatching")
+        end
       end
     end
   end
