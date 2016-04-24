@@ -1,0 +1,14 @@
+GEM
+  specs:
+    json (1.8.3)
+    redis (3.2.2)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  json
+  redis
+
+BUNDLED WITH
+   1.11.2
