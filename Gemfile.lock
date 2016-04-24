@@ -1,14 +1,22 @@
 GEM
   specs:
     json (1.8.3)
+    metaclass (0.0.4)
+    mocha (1.1.0)
+      metaclass (~> 0.0.1)
+    power_assert (0.2.6)
     redis (3.2.2)
+    test-unit (3.1.5)
+      power_assert
 
 PLATFORMS
   ruby
 
 DEPENDENCIES
   json
+  mocha
   redis
+  test-unit
 
 BUNDLED WITH
    1.11.2
