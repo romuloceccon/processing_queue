@@ -23,9 +23,13 @@ EOS
 
     def dispatch_all(&block)
       while @redis.exists(EVENTS_MAIN_QUEUE) do
+        # Process queue safely: move master queue to a temporary one that won't
+        # be touched by other clients. If this instance crashes the temporary
+        # queue will be merged again to the master (see {Processor#dispatcher}).
         @redis.rename(EVENTS_MAIN_QUEUE, EVENTS_TEMP_QUEUE)
         list = prepare_events(EVENTS_TEMP_QUEUE, &block)
 
+        # Enqueue events and delete temporary queue atomically
         @redis.multi do
           enqueue_events(list)
           @redis.del(EVENTS_TEMP_QUEUE)
@@ -50,6 +54,8 @@ EOS
         events.each do |(operator_id, installation_id, data)|
           op_str = operator_id.to_s
 
+          # Keep a set of known operators. On restart/cleanup we need to (TODO)
+          # scan for operator queues abandoned/locked by crashed clients. 
           @redis.sadd(OPERATORS_KNOWN_SET, op_str)
           @redis.lpush(OPERATORS_QUEUE, op_str) unless seen.include?(op_str)
           seen << op_str
