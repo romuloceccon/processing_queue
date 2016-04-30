@@ -335,4 +335,33 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("operators:processing"))
     assert_equal("20", @redis.rpop("operators:processing"))
   end
+
+  test "should ignore locked processing operator" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("operators:known", "20")
+    @redis.lpush("operators:processing", "20")
+    @redis.set("operators:20:lock", "abc")
+
+    dispatcher.dispatch_all { [0, 0] }
+
+    assert_equal([], @redis.lrange("operators:queue", 0, -1))
+    assert_equal(["20"], @redis.lrange("operators:processing", 0, -1))
+  end
+
+  test "should reenqueue processing operators while ignoring locked ones" do
+    dispatcher = @processor.dispatcher
+
+    (1..4).each do |i|
+      op = (i * 10).to_s
+      @redis.sadd("operators:known", op)
+      @redis.lpush("operators:processing", op)
+    end
+    @redis.set("operators:20:lock", "abc")
+    @redis.set("operators:40:lock", "def")
+
+    dispatcher.dispatch_all { [0, 0] }
+    assert_equal(["30", "10"], @redis.lrange("operators:queue", 0, -1))
+    assert_equal(["40", "20"], @redis.lrange("operators:processing", 0, -1))
+  end
 end

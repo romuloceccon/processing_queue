@@ -33,11 +33,12 @@ EOS
         list = []
       end
 
-      processing_cnt, abandoned = find_abandoned_operators
+      abandoned_operators = find_abandoned_operators
 
       # Enqueue events and delete temporary queue atomically
       @redis.multi do
-        enqueue_events(list, processing_cnt, abandoned)
+        seen_operators = enqueue_events(list)
+        enqueue_abandoned_operators(abandoned_operators, seen_operators)
         @redis.del(EVENTS_TEMP_QUEUE)
       end
     end
@@ -54,8 +55,8 @@ EOS
         end
       end
 
-      def enqueue_events(events, processing_operators_cnt, abandoned_operators)
-        seen = []
+      def enqueue_events(events)
+        result = []
 
         events.each do |(operator_id, installation_id, data)|
           op_str = operator_id.to_s
@@ -63,17 +64,16 @@ EOS
           # Keep a set of known operators. On restart/cleanup we need to scan
           # for operator queues abandoned/locked by crashed workers (see below).
           @redis.sadd(OPERATORS_KNOWN_SET, op_str)
-          @redis.lpush(OPERATORS_QUEUE, op_str) unless seen.include?(op_str)
-          seen << op_str
+          unless result.include?(op_str)
+            @redis.lpush(OPERATORS_QUEUE, op_str)
+            result << op_str
+          end
 
           @redis.lpush(operator_queue(op_str),
             { 'installation_id' => installation_id, 'data' => data }.to_json)
         end
 
-        abandoned_operators.each do |op_str|
-          @redis.lpush(OPERATORS_QUEUE, op_str) unless seen.include?(op_str)
-        end
-        (1..processing_operators_cnt).each { @redis.rpop(OPERATORS_TEMP) }
+        result
       end
 
       def find_abandoned_operators
@@ -82,11 +82,40 @@ EOS
           @redis.lrange(OPERATORS_TEMP, 0, -1)
         end
 
-        [processing.size, processing.select { |x| known.include?(x) }]
+        keep_list = []
+        abandoned = []
+
+        processing.reverse.each do |x|
+          keep_list << (locked = @redis.exists(operator_lock(x)))
+          abandoned << x if known.include?(x) && !locked
+        end
+        [keep_list, abandoned.uniq]
+      end
+
+      def enqueue_abandoned_operators(abandoned_operators, ignore_list)
+        keep_list, abandoned = abandoned_operators
+
+        abandoned.each do |op_str|
+          unless ignore_list.include?(op_str)
+            @redis.lpush(OPERATORS_QUEUE, op_str)
+          end
+        end
+
+        keep_list.each do |keep|
+          if keep
+            @redis.rpoplpush(OPERATORS_TEMP, OPERATORS_TEMP)
+          else
+            @redis.rpop(OPERATORS_TEMP)
+          end
+        end
       end
 
       def operator_queue(id)
         "operators:#{id}:events"
+      end
+
+      def operator_lock(id)
+        "operators:#{id}:lock"
       end
   end
 
