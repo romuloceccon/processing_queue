@@ -141,9 +141,9 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("operators:queue"))
     assert_equal("10", @redis.rpop("operators:queue"))
 
-    assert_equal(1, @redis.llen("operator:10:events"))
+    assert_equal(1, @redis.llen("operators:10:events"))
     assert_equal({ 'installation_id' => 500, 'data' => { 'id' => 1 } },
-      JSON.parse(@redis.rpop("operator:10:events")))
+      JSON.parse(@redis.rpop("operators:10:events")))
   end
 
   test "should dispatch two events from different operators" do
@@ -163,7 +163,7 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal("30", @redis.rpop("operators:queue"))
 
     (2..3).each do |i|
-      k = "operator:#{i * 10}:events"
+      k = "operators:#{i * 10}:events"
       assert_equal(1, @redis.llen(k))
       assert_equal({ 'installation_id' => i * 100, 'data' => { 'id' => i } },
         JSON.parse(@redis.rpop(k)))
@@ -185,7 +185,7 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("operators:queue"))
     assert_equal("10", @redis.rpop("operators:queue"))
 
-    k = "operator:10:events"
+    k = "operators:10:events"
     assert_equal(2, @redis.llen(k))
     (2..3).each do |i|
       assert_equal({ 'installation_id' => i * 100, 'data' => { 'id' => i } },

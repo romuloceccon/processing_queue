@@ -66,7 +66,7 @@ EOS
       end
 
       def operator_queue(id)
-        "operator:#{id}:events"
+        "operators:#{id}:events"
       end
   end
 
