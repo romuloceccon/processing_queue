@@ -269,11 +269,23 @@ class ProcessorTest < Test::Unit::TestCase
 
     assert_equal(["10", "20"], @redis.smembers("operators:known"))
 
-    assert_equal(2, @redis.llen("operators:queue"))
-    assert_equal("10", @redis.rpop("operators:queue"))
-    assert_equal("20", @redis.rpop("operators:queue"))
+    assert_equal(["20", "10"], @redis.lrange("operators:queue", 0, -1))
+    assert_equal([], @redis.lrange("operators:processing", 0, -1))
+  end
 
-    assert_equal(0, @redis.llen("operators:processing"))
+  test "should not reenqueue already enqueued processing operator" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("operators:known", "20")
+    @redis.lpush("operators:processing", "20")
+
+    @redis.lpush("events:queue", { "id" => 2 }.to_json)
+    dispatcher.dispatch_all { [20, 200] }
+
+    assert_equal(["20"], @redis.smembers("operators:known"))
+
+    assert_equal(["20"], @redis.lrange("operators:queue", 0, -1))
+    assert_equal([], @redis.lrange("operators:processing", 0, -1))
   end
 
   test "should reenqueue known processing operators even without events" do
