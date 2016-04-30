@@ -23,12 +23,17 @@ EOS
     end
 
     def dispatch_all(&block)
-      while @redis.exists(EVENTS_MAIN_QUEUE) do
-        # Process queue safely: move master queue to a temporary one that won't
-        # be touched by other clients. If this instance crashes the temporary
-        # queue will be merged again to the master (see {Processor#dispatcher}).
-        @redis.rename(EVENTS_MAIN_QUEUE, EVENTS_TEMP_QUEUE)
-        list = prepare_events(EVENTS_TEMP_QUEUE, &block)
+      loop do
+        if @redis.exists(EVENTS_MAIN_QUEUE)
+          # Process queue safely: move master queue to a temporary one that
+          # won't be touched by the workers. If this instance crashes the
+          # temporary queue will be merged again to the master (see
+          # {Processor#dispatcher}).
+          @redis.rename(EVENTS_MAIN_QUEUE, EVENTS_TEMP_QUEUE)
+          list = prepare_events(EVENTS_TEMP_QUEUE, &block)
+        else
+          list = []
+        end
 
         processing_cnt, abandoned = find_abandoned_operators
 
@@ -37,6 +42,8 @@ EOS
           enqueue_events(list, processing_cnt, abandoned)
           @redis.del(EVENTS_TEMP_QUEUE)
         end
+
+        break if list.empty?
       end
     end
 

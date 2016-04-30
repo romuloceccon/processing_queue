@@ -295,6 +295,20 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(0, @redis.llen("operators:processing"))
   end
 
+  test "should reenqueue known processing operators even without events" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("operators:known", "20")
+    @redis.lpush("operators:processing", "20")
+
+    dispatcher.dispatch_all { [0, 0] }
+
+    assert_equal(1, @redis.llen("operators:queue"))
+    assert_equal("20", @redis.rpop("operators:queue"))
+
+    assert_equal(0, @redis.llen("operators:processing"))
+  end
+
   test "should not reenqueue unknown processing operators" do
     dispatcher = @processor.dispatcher
 
@@ -321,11 +335,15 @@ class ProcessorTest < Test::Unit::TestCase
       redis_aux.lpush("operators:processing", "20")
     end
 
+    processing_lists = []
+    wrapper.before(:exists) do |*args|
+      processing_lists << @redis.lrange("operators:processing", 0, -1)
+    end
+
     @redis.lpush("operators:processing", "10")
     @redis.lpush("events:queue", { "id" => 3 }.to_json)
     dispatcher.dispatch_all { [30, 300] }
 
-    assert_equal(1, @redis.llen("operators:processing"))
-    assert_equal("20", @redis.rpop("operators:processing"))
+    assert_equal([["10"], ["20"]], processing_lists)
   end
 end
