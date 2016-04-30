@@ -276,4 +276,56 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal("10", @redis.rpop("operators:queue"))
     assert_equal("20", @redis.rpop("operators:queue"))
   end
+
+  test "should reenqueue known processing operators at end of queue" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("operators:known", "20")
+    @redis.lpush("operators:processing", "20")
+
+    @redis.lpush("events:queue", { "id" => 1 }.to_json)
+    dispatcher.dispatch_all { [10, 100] }
+
+    assert_equal(["10", "20"], @redis.smembers("operators:known"))
+
+    assert_equal(2, @redis.llen("operators:queue"))
+    assert_equal("10", @redis.rpop("operators:queue"))
+    assert_equal("20", @redis.rpop("operators:queue"))
+
+    assert_equal(0, @redis.llen("operators:processing"))
+  end
+
+  test "should not reenqueue unknown processing operators" do
+    dispatcher = @processor.dispatcher
+
+    @redis.lpush("operators:processing", "20")
+
+    @redis.lpush("events:queue", { "id" => 1 }.to_json)
+    dispatcher.dispatch_all { [10, 100] }
+
+    assert_equal(1, @redis.llen("operators:queue"))
+    assert_equal("10", @redis.rpop("operators:queue"))
+
+    assert_equal(0, @redis.llen("operators:processing"))
+  end
+
+  test "should not delete processing operator added during event dispatching" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = Processor.new(wrapper).dispatcher
+
+    @redis.sadd("operators:known", "10")
+    @redis.sadd("operators:known", "20")
+
+    redis_aux = Redis.new(db: 15)
+    wrapper.before(:sadd) do |*args|
+      redis_aux.lpush("operators:processing", "20")
+    end
+
+    @redis.lpush("operators:processing", "10")
+    @redis.lpush("events:queue", { "id" => 3 }.to_json)
+    dispatcher.dispatch_all { [30, 300] }
+
+    assert_equal(1, @redis.llen("operators:processing"))
+    assert_equal("20", @redis.rpop("operators:processing"))
+  end
 end

@@ -14,6 +14,7 @@ EOS
   EVENTS_TEMP_QUEUE = "events:dispatching".freeze
 
   OPERATORS_QUEUE = "operators:queue".freeze
+  OPERATORS_TEMP = "operators:processing".freeze
   OPERATORS_KNOWN_SET = "operators:known".freeze
 
   class Dispatcher
@@ -29,9 +30,11 @@ EOS
         @redis.rename(EVENTS_MAIN_QUEUE, EVENTS_TEMP_QUEUE)
         list = prepare_events(EVENTS_TEMP_QUEUE, &block)
 
+        processing_cnt, abandoned = find_abandoned_operators
+
         # Enqueue events and delete temporary queue atomically
         @redis.multi do
-          enqueue_events(list)
+          enqueue_events(list, processing_cnt, abandoned)
           @redis.del(EVENTS_TEMP_QUEUE)
         end
       end
@@ -49,13 +52,14 @@ EOS
         end
       end
 
-      def enqueue_events(events)
+      def enqueue_events(events, processing_operators_cnt, abandoned_operators)
         seen = []
+
         events.each do |(operator_id, installation_id, data)|
           op_str = operator_id.to_s
 
-          # Keep a set of known operators. On restart/cleanup we need to (TODO)
-          # scan for operator queues abandoned/locked by crashed clients. 
+          # Keep a set of known operators. On restart/cleanup we need to scan
+          # for operator queues abandoned/locked by crashed workers (see below).
           @redis.sadd(OPERATORS_KNOWN_SET, op_str)
           @redis.lpush(OPERATORS_QUEUE, op_str) unless seen.include?(op_str)
           seen << op_str
@@ -63,6 +67,20 @@ EOS
           @redis.lpush(operator_queue(op_str),
             { 'installation_id' => installation_id, 'data' => data }.to_json)
         end
+
+        abandoned_operators.each do |op_str|
+          @redis.lpush(OPERATORS_QUEUE, op_str) unless seen.include?(op_str)
+        end
+        (1..processing_operators_cnt).each { @redis.rpop(OPERATORS_TEMP) }
+      end
+
+      def find_abandoned_operators
+        known, processing = @redis.multi do
+          @redis.smembers(OPERATORS_KNOWN_SET)
+          @redis.lrange(OPERATORS_TEMP, 0, -1)
+        end
+
+        [processing.size, processing.select { |x| known.include?(x) }]
       end
 
       def operator_queue(id)
