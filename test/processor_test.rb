@@ -84,6 +84,16 @@ class ProcessorTest < Test::Unit::TestCase
     assert_not_nil(@processor.dispatcher)
   end
 
+  test "should initialize event counters" do
+    @redis.set("events:counters:received", "1")
+    @redis.set("events:counters:processed", "1")
+
+    @processor.dispatcher
+
+    assert_equal("0", @redis.get("events:counters:received"))
+    assert_equal("0", @redis.get("events:counters:processed"))
+  end
+
   test "should append dispatching events to queue on dispatcher creation" do
     @redis.lpush("events:dispatching", "1")
 
@@ -114,6 +124,7 @@ class ProcessorTest < Test::Unit::TestCase
     redis = mock
     redis.expects(:script).returns("678")
     redis.expects(:evalsha).with("678", ['events:dispatching', 'events:queue'])
+    redis.stubs(:set)
 
     p = Processor.new(redis)
     p.dispatcher
@@ -124,6 +135,7 @@ class ProcessorTest < Test::Unit::TestCase
     redis.expects(:script).once.returns("678")
     redis.expects(:evalsha).once.
       with("678", ['events:dispatching', 'events:queue'])
+    redis.stubs(:set)
 
     p = Processor.new(redis)
     assert_equal(p.dispatcher, p.dispatcher)
@@ -397,6 +409,18 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal([], @redis.smembers("operators:known"))
     assert_equal(0, @redis.llen("operators:1:events"))
     assert_equal(false, @redis.exists("operators:1:lock"))
+  end
+
+  test "should increment processed event counter" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+
+    worker.process("1")
+
+    assert_equal("2", @redis.get("events:counters:processed"))
   end
 
   test "should lock operator before processing" do

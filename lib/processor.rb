@@ -26,6 +26,9 @@ EOS
   EVENTS_MAIN_QUEUE = "events:queue".freeze
   EVENTS_TEMP_QUEUE = "events:dispatching".freeze
 
+  EVENTS_COUNTERS_RECEIVED = "events:counters:received"
+  EVENTS_COUNTERS_PROCESSED = "events:counters:processed"
+
   OPERATORS_QUEUE = "operators:queue".freeze
   OPERATORS_TEMP = "operators:processing".freeze
   OPERATORS_KNOWN_SET = "operators:known".freeze
@@ -144,6 +147,7 @@ EOS
       while event = @redis.lindex(queue, -1) do
         yield(JSON.parse(event)) if block_given?
         @redis.rpop(queue)
+        @redis.incr(EVENTS_COUNTERS_PROCESSED)
       end
 
       # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
@@ -161,6 +165,8 @@ EOS
     return @dispatcher if @dispatcher
 
     @redis.evalsha(@join_script, [EVENTS_TEMP_QUEUE, EVENTS_MAIN_QUEUE])
+    @redis.set(EVENTS_COUNTERS_RECEIVED, "0")
+    @redis.set(EVENTS_COUNTERS_PROCESSED, "0")
     @dispatcher = Dispatcher.new(@redis)
   end
 
