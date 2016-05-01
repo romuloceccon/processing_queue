@@ -8,5 +8,5 @@ loop do
   redis.lpush(Processor::EVENTS_MAIN_QUEUE, [n].to_json)
   redis.incr(Processor::EVENTS_COUNTERS_RECEIVED)
   puts(n.to_s)
-  Kernel.sleep(0.05)
+  Kernel.sleep(0.1)
 end
