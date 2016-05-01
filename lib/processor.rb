@@ -127,6 +127,7 @@ EOS
     def initialize(redis)
       @redis = redis
       @lock_id = SecureRandom.uuid
+      @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
     end
 
     def wait_for_operator
@@ -145,19 +146,20 @@ EOS
       end
 
       # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
-      @redis.eval(LUA_CLEAN_AND_UNLOCK, [lock, OPERATORS_KNOWN_SET, queue],
+      @redis.evalsha(@clean_script, [lock, OPERATORS_KNOWN_SET, queue],
         [@lock_id, operator])
     end
   end
 
   def initialize(redis)
     @redis = redis
+    @join_script = @redis.script('LOAD', LUA_JOIN_LISTS)
   end
 
   def dispatcher
     return @dispatcher if @dispatcher
 
-    @redis.eval(LUA_JOIN_LISTS, [EVENTS_TEMP_QUEUE, EVENTS_MAIN_QUEUE])
+    @redis.evalsha(@join_script, [EVENTS_TEMP_QUEUE, EVENTS_MAIN_QUEUE])
     @dispatcher = Dispatcher.new(@redis)
   end
 

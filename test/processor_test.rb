@@ -112,7 +112,8 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should push dispatching events atomically on dispatcher creation" do
     redis = mock
-    redis.expects(:eval)
+    redis.expects(:script).returns("678")
+    redis.expects(:evalsha).with("678", ['events:dispatching', 'events:queue'])
 
     p = Processor.new(redis)
     p.dispatcher
@@ -120,7 +121,9 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should not create dispatcher twice" do
     redis = mock
-    redis.expects(:eval).once
+    redis.expects(:script).once.returns("678")
+    redis.expects(:evalsha).once.
+      with("678", ['events:dispatching', 'events:queue'])
 
     p = Processor.new(redis)
     assert_equal(p.dispatcher, p.dispatcher)
