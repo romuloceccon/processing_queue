@@ -1,4 +1,5 @@
 require 'redis'
+require 'json'
 require 'securerandom'
 
 class Processor
