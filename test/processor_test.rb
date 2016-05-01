@@ -407,7 +407,7 @@ class ProcessorTest < Test::Unit::TestCase
     assert_raises(Error) { worker.process("1") { raise Error, "abort" } }
 
     assert_equal(1, @redis.llen("operators:1:events"))
-    assert_match(/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}$/,
+    assert_match(/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}\/#{Process.pid}$/,
       @redis.get("operators:1:lock"))
   end
 

@@ -127,7 +127,7 @@ EOS
   class Worker
     def initialize(redis)
       @redis = redis
-      @lock_id = SecureRandom.uuid
+      @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
     end
 
