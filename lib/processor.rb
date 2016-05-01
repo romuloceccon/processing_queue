@@ -4,6 +4,7 @@ require 'securerandom'
 
 class Processor
   LOCK_TIMEOUT = 300_000
+  MAX_BATCH_SIZE = 100
 
   LUA_JOIN_LISTS = <<EOS.freeze
 while true do
@@ -151,10 +152,21 @@ EOS
       begin
         return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
 
-        while !@interrupted && event = @redis.lindex(queue, -1) do
-          yield(JSON.parse(event)) if block_given?
-          @redis.rpop(queue)
-          @redis.incr(EVENTS_COUNTERS_PROCESSED)
+        cnt = 0
+        enum = Enumerator.new do |y|
+          while !@interrupted && cnt < MAX_BATCH_SIZE &&
+              event = @redis.lindex(queue, -(cnt + 1)) do
+            cnt += 1
+            y << JSON.parse(event)
+          end
+        end
+        yield(enum)
+
+        @redis.multi do
+          (1..cnt).each do
+            @redis.rpop(queue)
+            @redis.incr(EVENTS_COUNTERS_PROCESSED)
+          end
         end
 
         # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).

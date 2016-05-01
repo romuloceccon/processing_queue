@@ -400,15 +400,32 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
 
     cnt = 0
-    worker.process("1") do |event|
-      cnt += 1
-      assert_equal({ 'val' => cnt }, event)
+    worker.process("1") do |events|
+      events.each do |event|
+        cnt += 1
+        assert_equal({ 'val' => cnt }, event)
+      end
     end
 
     assert_equal(2, cnt)
     assert_equal([], @redis.smembers("operators:known"))
     assert_equal(0, @redis.llen("operators:1:events"))
     assert_equal(false, @redis.exists("operators:1:lock"))
+  end
+
+  test "should not change queue while processing events" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+
+    worker.process("1") do |events|
+      assert_equal(2, @redis.llen("operators:1:events"))
+      events.each {}
+      assert_equal(2, @redis.llen("operators:1:events"))
+    end
+    assert_equal(0, @redis.llen("operators:1:events"))
   end
 
   test "should increment processed event counter" do
@@ -418,7 +435,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
     @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
 
-    worker.process("1")
+    worker.process("1") { |events| events.each {} }
 
     assert_equal("2", @redis.get("events:counters:processed"))
   end
@@ -428,7 +445,9 @@ class ProcessorTest < Test::Unit::TestCase
 
     @redis.sadd("operators:known", "1")
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    assert_raises(Error) { worker.process("1") { raise Error, "abort" } }
+    assert_raises(Error) do
+      worker.process("1") { |events| events.each { raise Error, "abort" } }
+    end
 
     assert_equal(1, @redis.llen("operators:1:events"))
     assert_match(/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}\/#{Process.pid}$/,
@@ -439,7 +458,9 @@ class ProcessorTest < Test::Unit::TestCase
     worker = @processor.worker
 
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    assert_raises(Error) { worker.process("1") { raise Error, "abort" } }
+    assert_raises(Error) do
+      worker.process("1") { |events| events.each { raise Error, "abort" } }
+    end
 
     assert_in_delta(300_000, @redis.pttl("operators:1:lock"), 100)
   end
@@ -451,7 +472,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.set("operators:1:lock", "1234")
 
     cnt = 0
-    worker.process("1") { cnt += 1 }
+    worker.process("1") { |events| events.each { cnt += 1 } }
 
     assert_equal(0, cnt)
     assert_equal(1, @redis.llen("operators:1:events"))
@@ -465,7 +486,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
 
     wrapper.before(:rpop) { @redis.set("operators:1:lock", "1234") }
-    worker.process("1") {}
+    worker.process("1") { |events| events.each {} }
 
     assert_equal("1234", @redis.get("operators:1:lock"))
   end
@@ -477,27 +498,82 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.sadd("operators:known", "1")
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
 
-    wrapper.after(:lindex) do
-      if @redis.llen("operators:1:events") == 0
-        @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
-      end
+    wrapper.before(:multi) do
+      @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
     end
-    worker.process("1") {}
+    worker.process("1") { |events| events.each {} }
 
     assert_equal(["1"], @redis.smembers("operators:known"))
     assert_equal(1, @redis.llen("operators:1:events"))
     assert_equal(false, @redis.exists("operators:1:lock"))
   end
 
-  test "should process events without a block" do
+  test "should stop processing if interrupted" do
     worker = @processor.worker
 
     @redis.sadd("operators:known", "1")
     @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
 
-    worker.process("1")
+    worker.process("1") do |events|
+      events.each { worker.instance_variable_set(:@interrupted, 1) }
+    end
 
+    assert_equal(["1"], @redis.smembers("operators:known"))
+    assert_equal(1, @redis.llen("operators:1:events"))
+    assert_equal(false, @redis.exists("operators:1:lock"))
+  end
+
+  test "should continue processing if new events arrive after batch starts" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+
+    cnt = 0
+    worker.process("1") do |events|
+      events.each do |event|
+        cnt += 1
+        if cnt == 2
+          @redis.lpush("operators:1:events", { 'val' => 3 }.to_json)
+          @redis.lpush("operators:1:events", { 'val' => 4 }.to_json)
+        end
+      end
+    end
+
+    assert_equal(4, cnt)
     assert_equal([], @redis.smembers("operators:known"))
     assert_equal(0, @redis.llen("operators:1:events"))
+  end
+
+  test "should limit worker batch size" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    (1..150).each do |i|
+      @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    end
+
+    cnt = 0
+    worker.process("1") { |events| events.each { cnt += 1 } }
+
+    assert_equal(100, cnt)
+    assert_equal(["1"], @redis.smembers("operators:known"))
+    assert_equal(50, @redis.llen("operators:1:events"))
+  end
+
+  test "should be able to break from processing" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    (1..3).each do |i|
+      @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    end
+
+    worker.process("1") { |events| events.each { break } }
+
+    assert_equal(["1"], @redis.smembers("operators:known"))
+    assert_equal(2, @redis.llen("operators:1:events"))
   end
 end
