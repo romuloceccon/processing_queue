@@ -3,6 +3,7 @@ require 'json'
 
 processor = Processor.new(Redis.new)
 worker = processor.worker
+worker.trap!
 
 loop do
   operator = worker.wait_for_operator

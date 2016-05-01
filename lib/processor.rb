@@ -132,9 +132,14 @@ EOS
       @redis = redis
       @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
+
+      @handler_flag = proc { |val| @interrupted = val }
+      @handler_exit = proc { |val| @interrupted = val; terminate }
+      @trap_handler = @handler_exit
     end
 
     def wait_for_operator
+      terminate if @interrupted
       @redis.brpoplpush(OPERATORS_QUEUE, OPERATORS_TEMP)
     end
 
@@ -142,18 +147,35 @@ EOS
       queue = Processor.operator_queue(operator)
       lock = Processor.operator_lock(operator)
 
-      return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
+      @trap_handler = @handler_flag
+      begin
+        return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
 
-      while event = @redis.lindex(queue, -1) do
-        yield(JSON.parse(event)) if block_given?
-        @redis.rpop(queue)
-        @redis.incr(EVENTS_COUNTERS_PROCESSED)
+        while !@interrupted && event = @redis.lindex(queue, -1) do
+          yield(JSON.parse(event)) if block_given?
+          @redis.rpop(queue)
+          @redis.incr(EVENTS_COUNTERS_PROCESSED)
+        end
+
+        # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
+        @redis.evalsha(@clean_script, [lock, OPERATORS_KNOWN_SET, queue],
+          [@lock_id, operator])
+      ensure
+        @trap_handler = @handler_exit
       end
-
-      # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
-      @redis.evalsha(@clean_script, [lock, OPERATORS_KNOWN_SET, queue],
-        [@lock_id, operator])
     end
+
+    def trap!
+      return if @trapped
+      @trapped = true
+      Signal.trap('INT') { @trap_handler.call(130) }
+      Signal.trap('TERM') { @trap_handler.call(143) }
+    end
+
+    private
+      def terminate
+        exit(@interrupted)
+      end
   end
 
   def initialize(redis)
