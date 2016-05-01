@@ -140,7 +140,7 @@ EOS
       return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
 
       while event = @redis.lindex(queue, -1) do
-        yield(JSON.parse(event))
+        yield(JSON.parse(event)) if block_given?
         @redis.rpop(queue)
       end
 

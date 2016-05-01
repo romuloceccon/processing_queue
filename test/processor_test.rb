@@ -461,4 +461,16 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("operators:1:events"))
     assert_equal(false, @redis.exists("operators:1:lock"))
   end
+
+  test "should process events without a block" do
+    worker = @processor.worker
+
+    @redis.sadd("operators:known", "1")
+    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+
+    worker.process("1")
+
+    assert_equal([], @redis.smembers("operators:known"))
+    assert_equal(0, @redis.llen("operators:1:events"))
+  end
 end
