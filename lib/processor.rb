@@ -1,6 +1,8 @@
 require 'redis'
+require 'securerandom'
 
 class Processor
+  LOCK_TIMEOUT = 300_000
 
   LUA_JOIN_LISTS = <<EOS.freeze
 while true do
@@ -8,6 +10,16 @@ while true do
   if not val then return end
   redis.call('RPUSH', KEYS[2], val)
 end
+EOS
+
+  LUA_CLEAN_AND_UNLOCK = <<EOS.freeze
+if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('SREM', KEYS[2], ARGV[2])
+end
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
 EOS
 
   EVENTS_MAIN_QUEUE = "events:queue".freeze
@@ -69,7 +81,7 @@ EOS
             result << op_str
           end
 
-          @redis.lpush(operator_queue(op_str),
+          @redis.lpush(Processor.operator_queue(op_str),
             { 'installation_id' => installation_id, 'data' => data }.to_json)
         end
 
@@ -86,7 +98,7 @@ EOS
         abandoned = []
 
         processing.reverse.each do |x|
-          keep_list << (locked = @redis.exists(operator_lock(x)))
+          keep_list << (locked = @redis.exists(Processor.operator_lock(x)))
           abandoned << x if known.include?(x) && !locked
         end
         [keep_list, abandoned.uniq]
@@ -109,14 +121,33 @@ EOS
           end
         end
       end
+  end
 
-      def operator_queue(id)
-        "operators:#{id}:events"
+  class Worker
+    def initialize(redis)
+      @redis = redis
+      @lock_id = SecureRandom.uuid
+    end
+
+    def wait_for_operator
+      @redis.brpoplpush(OPERATORS_QUEUE, OPERATORS_TEMP)
+    end
+
+    def process(operator)
+      queue = Processor.operator_queue(operator)
+      lock = Processor.operator_lock(operator)
+
+      return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
+
+      while event = @redis.lindex(queue, -1) do
+        yield(JSON.parse(event))
+        @redis.rpop(queue)
       end
 
-      def operator_lock(id)
-        "operators:#{id}:lock"
-      end
+      # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
+      @redis.eval(LUA_CLEAN_AND_UNLOCK, [lock, OPERATORS_KNOWN_SET, queue],
+        [@lock_id, operator])
+    end
   end
 
   def initialize(redis)
@@ -130,4 +161,15 @@ EOS
     @dispatcher = Dispatcher.new(@redis)
   end
 
+  def worker
+    return Worker.new(@redis)
+  end
+
+  def self.operator_queue(id)
+    "operators:#{id}:events"
+  end
+
+  def self.operator_lock(id)
+    "operators:#{id}:lock"
+  end
 end
