@@ -4,7 +4,7 @@ require 'processor'
 
 class Stats
   attr_reader :events_received, :events_processed, :events_queued,
-    :events_waiting, :operators
+    :events_waiting, :operators, :counter_times, :counter_counts
 
   class Operator
     attr_reader :name, :count, :locked_by, :ttl
@@ -66,6 +66,30 @@ class Stats
     @operators.sort!
 
     @events_waiting = @operators.inject(0) { |r, obj| r + obj.count }
+
+    res = Processor::PERF_COUNTER_RESOLUTION
+
+    t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    slot = (t / res).to_i
+    values = @redis.multi do
+      slot.downto(slot - 900 / res + 1).each do |s|
+        @redis.get("events:counters:#{s}:time")
+        @redis.get("events:counters:#{s}:count")
+      end
+    end
+
+    @counter_times = [0.0, 0.0, 0.0]
+    @counter_counts = [0, 0, 0]
+    # 1 min, 5 min, 15 min
+    [60, 300, 900].each_with_index do |t, i|
+      cnt = t / res
+      0.upto(cnt - 1).each do |p|
+        @counter_times[i] += values[p * 2].to_f
+        @counter_counts[i] += values[p * 2 + 1].to_i
+      end
+      @counter_times[i] /= t
+      @counter_counts[i] /= (t / 60)
+    end
   end
 end
 
@@ -140,6 +164,43 @@ class Events
     @window.addstr('%6d' % [@stats.events_processed])
     @window.attroff(Curses::A_BOLD)
     @window.addstr(' processed')
+
+    @window.refresh
+  end
+
+  def close
+    @window.close
+  end
+end
+
+class Performance
+  def initialize(stats, top)
+    @top = top
+    @stats = stats
+
+    @window = Curses::Window.new(2, 80, @top, 0)
+  end
+
+  def update
+    @window.clear
+
+    @window.setpos(0, 0)
+    @window.addstr('Worker load:         ')
+
+    @window.attron(Curses::A_BOLD)
+    (0..2).each do |i|
+      @window.addstr('%10.2f' % [@stats.counter_times[i]])
+    end
+    @window.attroff(Curses::A_BOLD)
+
+    @window.setpos(1, 0)
+    @window.addstr('Throughput (ev/min): ')
+
+    @window.attron(Curses::A_BOLD)
+    (0..2).each do |i|
+      @window.addstr('%10d' % [@stats.counter_counts[i]])
+    end
+    @window.attroff(Curses::A_BOLD)
 
     @window.refresh
   end
@@ -227,7 +288,8 @@ begin
 
   header = Header.new('VMpay queue monitor', 0)
   events = Events.new(stats, 3)
-  operators = Operators.new(stats, 5)
+  performance = Performance.new(stats, 4)
+  operators = Operators.new(stats, 7)
 
   begin
     loop do
@@ -235,6 +297,7 @@ begin
 
       header.update
       events.update
+      performance.update
       operators.update
 
       break if operators.wait
@@ -242,6 +305,7 @@ begin
   ensure
     header.close
     events.close
+    performance.close
     operators.close
   end
 ensure

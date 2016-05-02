@@ -6,6 +6,9 @@ class Processor
   LOCK_TIMEOUT = 300_000
   MAX_BATCH_SIZE = 100
 
+  PERF_COUNTER_RESOLUTION = 5  # 5 seconds
+  PERF_COUNTER_HISTORY = 900   # 15 minutes
+
   LUA_JOIN_LISTS = <<EOS.freeze
 while true do
   local val = redis.call('LPOP', KEYS[1])
@@ -22,6 +25,12 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+EOS
+
+  LUA_INC_PERF_COUNTER = <<EOS.freeze
+local exists = redis.call("EXISTS", KEYS[1]) == 1
+redis.call("INCRBYFLOAT", KEYS[1], ARGV[1])
+if not exists then redis.call("EXPIRE", KEYS[1], ARGV[2]) end
 EOS
 
   EVENTS_MAIN_QUEUE = "events:queue".freeze
@@ -133,6 +142,7 @@ EOS
       @redis = redis
       @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
+      @inc_counter_script = @redis.script('LOAD', LUA_INC_PERF_COUNTER)
 
       @handler_flag = proc { |val| @interrupted = val }
       @handler_exit = proc { |val| @interrupted = val; terminate }
@@ -152,15 +162,19 @@ EOS
       begin
         return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
 
+        performance = Performance.new(@redis, @inc_counter_script)
+
         cnt = 0
         enum = Enumerator.new do |y|
           while !@interrupted && cnt < MAX_BATCH_SIZE &&
               event = @redis.lindex(queue, -(cnt + 1)) do
             cnt += 1
+            performance.store(1)
             y << JSON.parse(event)
           end
         end
         yield(enum)
+        performance.store(0)
 
         @redis.multi do
           (1..cnt).each do
@@ -187,6 +201,36 @@ EOS
     private
       def terminate
         exit(@interrupted)
+      end
+  end
+
+  class Performance
+    def initialize(redis, script)
+      @redis = redis
+      @script = script
+      @previous = get_time
+    end
+
+    def store(count)
+      t = get_time
+      diff, @previous = t - @previous, t
+
+      slot = (t / PERF_COUNTER_RESOLUTION).to_i
+      time_counter = "events:counters:#{slot}:time"
+      cnt_counter = "events:counters:#{slot}:count"
+
+      update_counter(time_counter, diff)
+      update_counter(cnt_counter, count)
+    end
+
+    private
+      def get_time
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
+      def update_counter(counter, val)
+        return if val <= 0
+        @redis.evalsha(@script, [counter], [val, PERF_COUNTER_HISTORY])
       end
   end
 
