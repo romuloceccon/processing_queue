@@ -45,6 +45,12 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.flushdb
   end
 
+  SLOTS_PER_MIN = 60 / Processor::PERF_COUNTER_RESOLUTION
+
+  def slot_number(t)
+    (t / Processor::PERF_COUNTER_RESOLUTION).to_i
+  end
+
   # ----- test framework tests -----
 
   test "should cleanup database" do
@@ -576,4 +582,180 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal(["1"], @redis.smembers("operators:known"))
     assert_equal(2, @redis.llen("operators:1:events"))
   end
+
+  # ----- statistics unit tests -----
+
+  test "should count received events" do
+    @redis.set('events:counters:received', 7)
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(7, @statistics.received_count)
+  end
+
+  test "should count processed events" do
+    @redis.set('events:counters:processed', 13)
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(13, @statistics.processed_count)
+  end
+
+  test "should calculate queue length" do
+    ('a'..'c').each { |c| @redis.lpush('events:queue', c) }
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.queue_length)
+  end
+
+  test "should get known operator status" do
+    @redis.sadd('operators:known', '1')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.operators.count)
+    operator = @statistics.operators.first
+    assert_false(operator.queued?)
+    assert_false(operator.taken?)
+  end
+
+  test "should get queued operator status" do
+    @redis.sadd('operators:known', '1')
+    @redis.lpush('operators:queue', '1')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.operators.count)
+    operator = @statistics.operators.first
+    assert_false(operator.locked?)
+    assert_true(operator.queued?)
+    assert_false(operator.taken?)
+  end
+
+  test "should get processing operator status" do
+    @redis.sadd('operators:known', '1')
+    @redis.lpush('operators:processing', '1')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.operators.count)
+    operator = @statistics.operators.first
+    assert_false(operator.locked?)
+    assert_false(operator.queued?)
+    assert_true(operator.taken?)
+  end
+
+  test "should calculate operator queue length" do
+    @redis.sadd('operators:known', '1')
+    ('a'..'c').each { |c| @redis.lpush('operators:1:events', c) }
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.operators.count)
+    operator = @statistics.operators.first
+    assert_equal(3, operator.count)
+  end
+
+  test "should calculate waiting event count" do
+    @redis.sadd('operators:known', '1')
+    ('a'..'c').each { |c| @redis.lpush('operators:1:events', c) }
+    @redis.sadd('operators:known', '2')
+    ('d'..'e').each { |c| @redis.lpush('operators:2:events', c) }
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(5, @statistics.waiting_count)
+  end
+
+  test "should show operator lock status" do
+    @redis.sadd('operators:known', '1')
+    @redis.set('operators:1:lock', '1234567890/1500')
+    @redis.pexpire('operators:1:lock', 60_000)
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.operators.count)
+    operator = @statistics.operators.first
+    assert_true(operator.locked?)
+    assert_equal('1500', operator.locked_by)
+    assert_in_delta(60_000, operator.ttl, 50)
+  end
+
+  test "should sort operators by numeric value" do
+    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '10')
+    @redis.sadd('operators:known', '+20')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.operators.count)
+    assert_equal(['a', '10', '+20'], @statistics.operators.map(&:name))
+  end
+
+  test "should sort operators by queue length" do
+    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '10')
+    @redis.sadd('operators:known', '+20')
+    @redis.lpush('operators:+20:events', 'a')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.operators.count)
+    assert_equal(['+20', 'a', '10'], @statistics.operators.map(&:name))
+  end
+
+  test "should sort operators by lock status" do
+    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '10')
+    @redis.sadd('operators:known', '+20')
+    @redis.lpush('operators:+20:events', 'a')
+    @redis.set('operators:10:lock', '123/123')
+    @statistics = Processor::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.operators.count)
+    assert_equal(['10', '+20', 'a'], @statistics.operators.map(&:name))
+  end
+
+  test "should count events in last minute" do
+    prepare_event_counter_test(1, 9, 2.22)
+    @statistics = Processor::Statistics.new(@redis)
+
+    counter = @statistics.counters[0]
+    assert_equal(9 * SLOTS_PER_MIN, counter.count)
+    assert_equal(9 * SLOTS_PER_MIN, counter.count_per_min)
+    assert_in_delta(2.22 * SLOTS_PER_MIN / 60, counter.time_busy, 0.1)
+  end
+
+  test "should count events in last 5 minutes" do
+    prepare_event_counter_test(5, 10, 3.33)
+    @statistics = Processor::Statistics.new(@redis)
+
+    counter = @statistics.counters[1]
+    assert_equal(10 * SLOTS_PER_MIN * 5, counter.count)
+    assert_equal(10 * SLOTS_PER_MIN, counter.count_per_min)
+    assert_in_delta(3.33 * SLOTS_PER_MIN / 60, counter.time_busy, 0.1)
+  end
+
+  test "should count events in last 15 minutes" do
+    prepare_event_counter_test(15, 11, 4.44)
+    @statistics = Processor::Statistics.new(@redis)
+
+    counter = @statistics.counters[2]
+    assert_equal(11 * SLOTS_PER_MIN * 15, counter.count)
+    assert_equal(11 * SLOTS_PER_MIN, counter.count_per_min)
+    assert_in_delta(4.44 * SLOTS_PER_MIN / 60, counter.time_busy, 0.1)
+  end
+
+  private
+    def prepare_event_counter_test(mins, count_per_slot, time_per_slot)
+      t = 100_001
+      slot = slot_number(t)
+      (1..(SLOTS_PER_MIN * mins)).each do |i|
+        @redis.set("events:counters:#{slot - i}:count", count_per_slot)
+        @redis.set("events:counters:#{slot - i}:time", time_per_slot)
+      end
+      # We want to calculate the last {SLOTS_PER_MIN * mins} *whole* slots. So,
+      # it should not include (we create a counter with 10 times the normal
+      # event count/time so it's easy to notice any calculation error):
+      # - the current slot
+      @redis.set("events:counters:#{slot}:count", count_per_slot * 10)
+      @redis.set("events:counters:#{slot}:time", time_per_slot * 10)
+      # - any slot before the last {SLOTS_PER_MIN * mins} whole slots.
+      @redis.set("events:counters:#{slot - (SLOTS_PER_MIN * mins) - 1}:count",
+        count_per_slot * 10)
+      @redis.set("events:counters:#{slot - (SLOTS_PER_MIN * mins) - 1}:time",
+        time_per_slot * 10)
+
+      Process.expects(:clock_gettime).with(Process::CLOCK_MONOTONIC).returns(t)
+    end
 end

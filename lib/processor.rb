@@ -234,6 +234,110 @@ EOS
       end
   end
 
+  class Statistics
+    class Operator
+      attr_reader :name, :count, :locked_by, :ttl
+
+      def initialize(redis, operator_id, queued_operators, processing_operators)
+        @name = operator_id
+        @count = redis.llen("operators:#{operator_id}:events")
+        @queued = queued_operators.include?(operator_id)
+        @processing = processing_operators.include?(operator_id)
+
+        lock_name = "operators:#{operator_id}:lock"
+        if lock = redis.get(lock_name)
+          @locked_by = lock.split('/').last
+          @ttl = redis.pttl(lock_name)
+        end
+      end
+
+      def locked?
+        !!@locked_by
+      end
+
+      def queued?
+        @queued
+      end
+
+      def taken?
+        @processing
+      end
+
+      def <=>(other)
+        return locked? ? -1 : 1 if locked? ^ other.locked?
+        return other.count <=> count if count != other.count
+        return name.to_i <=> other.name.to_i
+      end
+    end
+
+    class Counter
+      attr_reader :count, :count_per_min, :time_busy
+
+      def initialize(secs, values_count, values_time)
+        @count = sum_recent_counters(values_count, secs)
+        @count_per_min = @count / (secs / 60)
+        @time_busy = sum_recent_counters(values_time, secs) / secs
+      end
+
+      private
+        def sum_recent_counters(arr, secs)
+          arr.slice(0, secs / Processor::PERF_COUNTER_RESOLUTION).
+            inject(0) { |acc, x| acc + x }
+        end
+    end
+
+    attr_reader :received_count, :processed_count, :waiting_count, :queue_length
+    attr_reader :operators
+    attr_reader :counters
+
+    def initialize(redis)
+      @redis = redis
+      update
+    end
+
+    def update
+      @received_count = @redis.get('events:counters:received').to_i
+      @processed_count = @redis.get('events:counters:processed').to_i
+      @queue_length = @redis.llen('events:queue').to_i
+
+      op_known, op_queued, op_processing = @redis.multi do
+        @redis.smembers('operators:known')
+        @redis.lrange('operators:queue', 0, -1)
+        @redis.lrange('operators:processing', 0, -1)
+      end
+
+      op_all = (op_known + op_queued + op_processing).uniq
+      @operators = op_all.map do |op_id|
+        Operator.new(@redis, op_id, op_queued, op_processing)
+      end
+      @operators.sort!
+
+      @waiting_count = @operators.inject(0) { |r, obj| r + obj.count }
+
+      res = Processor::PERF_COUNTER_RESOLUTION
+      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      cur_slot = (t / res).to_i
+      slot_cnt = (900 / res).to_i
+
+      values = @redis.multi do
+        (1..slot_cnt).each do |s|
+          @redis.get("events:counters:#{cur_slot - s}:count")
+        end
+        (1..slot_cnt).each do |s|
+          @redis.get("events:counters:#{cur_slot - s}:time")
+        end
+      end
+
+      values_count = values.slice(0, slot_cnt).map(&:to_i)
+      values_time = values.slice(slot_cnt, 2 * slot_cnt).map(&:to_f)
+
+      @counters = [
+        Counter.new(60, values_count, values_time),
+        Counter.new(300, values_count, values_time),
+        Counter.new(900, values_count, values_time)]
+    end
+  end
+
   def initialize(redis)
     @redis = redis
     @join_script = @redis.script('LOAD', LUA_JOIN_LISTS)
