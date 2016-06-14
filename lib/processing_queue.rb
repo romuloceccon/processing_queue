@@ -2,7 +2,7 @@ require 'redis'
 require 'json'
 require 'securerandom'
 
-class Processor
+class ProcessingQueue
   LOCK_TIMEOUT = 300_000
   MAX_BATCH_SIZE = 100
 
@@ -52,7 +52,7 @@ EOS
       if @redis.exists(INITIAL_QUEUE)
         # Process queue safely: move master queue to a temporary one that won't
         # be touched by the workers. If this instance crashes the temporary
-        # queue will be merged again to the master (see {Processor#dispatcher}).
+        # queue will be merged again to the master (see {ProcessingQueue#dispatcher}).
         @redis.rename(INITIAL_QUEUE, DISPATCHING_EVENTS_LIST)
         list = prepare_events(DISPATCHING_EVENTS_LIST, &block)
       else
@@ -98,7 +98,7 @@ EOS
           hsh = {}
           hsh['data'] = data
           hsh['object'] = object if object
-          @redis.lpush(Processor.queue_events_list(id_str), hsh.to_json)
+          @redis.lpush(ProcessingQueue.queue_events_list(id_str), hsh.to_json)
         end
 
         result
@@ -114,7 +114,7 @@ EOS
         abandoned = []
 
         processing.reverse.each do |x|
-          keep_list << (locked = @redis.exists(Processor.queue_lock(x)))
+          keep_list << (locked = @redis.exists(ProcessingQueue.queue_lock(x)))
           abandoned << x if known.include?(x) && !locked
         end
         [keep_list, abandoned.uniq]
@@ -158,8 +158,8 @@ EOS
     end
 
     def process(queue_id)
-      queue = Processor.queue_events_list(queue_id)
-      lock = Processor.queue_lock(queue_id)
+      queue = ProcessingQueue.queue_events_list(queue_id)
+      lock = ProcessingQueue.queue_lock(queue_id)
 
       @trap_handler = @handler_flag
       begin
@@ -243,12 +243,12 @@ EOS
 
       def initialize(redis, queue_id, waiting_queues, processing_queues)
         @name = queue_id
-        @count = redis.llen(Processor.queue_events_list(queue_id))
+        @count = redis.llen(ProcessingQueue.queue_events_list(queue_id))
         @queued = waiting_queues.include?(queue_id)
         @processing = processing_queues.include?(queue_id)
         @locked_by = @ttl = nil
 
-        lock_name = Processor.queue_lock(queue_id)
+        lock_name = ProcessingQueue.queue_lock(queue_id)
         if lock = redis.get(lock_name)
           @locked_by = lock.split('/').last
           @ttl = redis.pttl(lock_name)
@@ -285,7 +285,7 @@ EOS
 
       private
         def sum_recent_counters(arr, secs)
-          arr.slice(0, secs / Processor::PERF_COUNTER_RESOLUTION).
+          arr.slice(0, secs / ProcessingQueue::PERF_COUNTER_RESOLUTION).
             inject(0) { |acc, x| acc + x }
         end
     end
@@ -302,12 +302,12 @@ EOS
     def update
       @received_count = @redis.get('events:counters:received').to_i
       @processed_count = @redis.get('events:counters:processed').to_i
-      @queue_length = @redis.llen(Processor::INITIAL_QUEUE).to_i
+      @queue_length = @redis.llen(ProcessingQueue::INITIAL_QUEUE).to_i
 
       q_known, q_waiting, q_processing = @redis.multi do
-        @redis.smembers(Processor::KNOWN_QUEUES_SET)
-        @redis.lrange(Processor::WAITING_QUEUES_LIST, 0, -1)
-        @redis.lrange(Processor::PROCESSING_QUEUES_LIST, 0, -1)
+        @redis.smembers(ProcessingQueue::KNOWN_QUEUES_SET)
+        @redis.lrange(ProcessingQueue::WAITING_QUEUES_LIST, 0, -1)
+        @redis.lrange(ProcessingQueue::PROCESSING_QUEUES_LIST, 0, -1)
       end
 
       q_all = (q_known + q_waiting + q_processing).uniq
@@ -318,7 +318,7 @@ EOS
 
       @waiting_count = @queues.inject(0) { |r, obj| r + obj.count }
 
-      res = Processor::PERF_COUNTER_RESOLUTION
+      res = ProcessingQueue::PERF_COUNTER_RESOLUTION
       t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       cur_slot = (t / res).to_i
       slot_cnt = (900 / res).to_i

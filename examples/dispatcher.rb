@@ -1,6 +1,6 @@
-require 'processor'
+require 'processing_queue'
 
-processor = Processor.new(Redis.new)
+processor = ProcessingQueue.new(Redis.new)
 dispatcher = processor.dispatcher
 
 loop do

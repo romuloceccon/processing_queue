@@ -1,9 +1,9 @@
 require 'test/unit'
 require 'mocha/test_unit'
 require 'json'
-require 'processor'
+require 'processing_queue'
 
-class ProcessorTest < Test::Unit::TestCase
+class ProcessingQueueTest < Test::Unit::TestCase
   # ----- test framework -----
 
   class Error < StandardError
@@ -38,17 +38,17 @@ class ProcessorTest < Test::Unit::TestCase
 
   setup do
     @redis = Redis.new(db: 15)
-    @processor = Processor.new(@redis)
+    @processor = ProcessingQueue.new(@redis)
   end
 
   teardown do
     @redis.flushdb
   end
 
-  SLOTS_PER_MIN = 60 / Processor::PERF_COUNTER_RESOLUTION
+  SLOTS_PER_MIN = 60 / ProcessingQueue::PERF_COUNTER_RESOLUTION
 
   def slot_number(t)
-    (t / Processor::PERF_COUNTER_RESOLUTION).to_i
+    (t / ProcessingQueue::PERF_COUNTER_RESOLUTION).to_i
   end
 
   # ----- test framework tests -----
@@ -59,7 +59,7 @@ class ProcessorTest < Test::Unit::TestCase
   end
 
   test "should wrap redis" do
-    processor = Processor.new(Wrapper.new(@redis))
+    processor = ProcessingQueue.new(Wrapper.new(@redis))
 
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
     processor.dispatcher.dispatch_all { [1, 1] }
@@ -69,7 +69,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should hook redis methods" do
     wrapper = Wrapper.new(@redis)
-    dispatcher = Processor.new(wrapper).dispatcher
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
 
     before, after = nil, nil
 
@@ -132,7 +132,7 @@ class ProcessorTest < Test::Unit::TestCase
     redis.expects(:evalsha).with("678", ['events:dispatching', 'events:queue'])
     redis.stubs(:set)
 
-    p = Processor.new(redis)
+    p = ProcessingQueue.new(redis)
     p.dispatcher
   end
 
@@ -143,7 +143,7 @@ class ProcessorTest < Test::Unit::TestCase
       with("678", ['events:dispatching', 'events:queue'])
     redis.stubs(:set)
 
-    p = Processor.new(redis)
+    p = ProcessingQueue.new(redis)
     assert_equal(p.dispatcher, p.dispatcher)
   end
 
@@ -280,7 +280,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should dispatch events atomically" do
     wrapper = Wrapper.new(@redis)
-    dispatcher = Processor.new(wrapper).dispatcher
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
 
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
 
@@ -354,7 +354,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should not delete processing operator added during event dispatching" do
     wrapper = Wrapper.new(@redis)
-    dispatcher = Processor.new(wrapper).dispatcher
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
 
     @redis.sadd("queues:known", "10")
     @redis.sadd("queues:known", "20")
@@ -501,7 +501,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should not unlock lock from another worker" do
     wrapper = Wrapper.new(@redis)
-    worker = Processor.new(wrapper).worker
+    worker = ProcessingQueue.new(wrapper).worker
 
     @redis.sadd("queues:known", "1")
     @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
@@ -514,7 +514,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should not remove operator from known set if queue is not empty" do
     wrapper = Wrapper.new(@redis)
-    worker = Processor.new(wrapper).worker
+    worker = ProcessingQueue.new(wrapper).worker
 
     @redis.sadd("queues:known", "1")
     @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
@@ -602,28 +602,28 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should count received events" do
     @redis.set('events:counters:received', 7)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(7, @statistics.received_count)
   end
 
   test "should count processed events" do
     @redis.set('events:counters:processed', 13)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(13, @statistics.processed_count)
   end
 
   test "should calculate queue length" do
     ('a'..'c').each { |c| @redis.lpush('events:queue', c) }
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queue_length)
   end
 
   test "should get known operator status" do
     @redis.sadd("queues:known", '1')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
@@ -634,7 +634,7 @@ class ProcessorTest < Test::Unit::TestCase
   test "should get queued operator status" do
     @redis.sadd("queues:known", '1')
     @redis.lpush("queues:waiting", '1')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
@@ -646,7 +646,7 @@ class ProcessorTest < Test::Unit::TestCase
   test "should get processing operator status" do
     @redis.sadd("queues:known", '1')
     @redis.lpush("queues:processing", '1')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
@@ -658,7 +658,7 @@ class ProcessorTest < Test::Unit::TestCase
   test "should calculate operator queue length" do
     @redis.sadd("queues:known", '1')
     ('a'..'c').each { |c| @redis.lpush("queues:1:events", c) }
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
@@ -670,7 +670,7 @@ class ProcessorTest < Test::Unit::TestCase
     ('a'..'c').each { |c| @redis.lpush("queues:1:events", c) }
     @redis.sadd("queues:known", '2')
     ('d'..'e').each { |c| @redis.lpush("queues:2:events", c) }
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(5, @statistics.waiting_count)
   end
@@ -679,7 +679,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.sadd("queues:known", '1')
     @redis.set("queues:1:lock", '1234567890/1500')
     @redis.pexpire("queues:1:lock", 60_000)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
@@ -693,7 +693,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.sadd("queues:known", '10')
     @redis.sadd("queues:known", 'a')
     @redis.sadd("queues:known", '{c}')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(4, @statistics.queues.count)
     assert_equal(['+11', '10', 'a', '{c}'], @statistics.queues.map(&:name))
@@ -704,7 +704,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.sadd("queues:known", '10')
     @redis.sadd("queues:known", 'a')
     @redis.lpush("queues:a:events", 'a')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queues.count)
     assert_equal(['a', '+11', '10'], @statistics.queues.map(&:name))
@@ -716,7 +716,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.sadd("queues:known", 'a')
     @redis.lpush("queues:a:events", 'a')
     @redis.set("queues:10:lock", '123/123')
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queues.count)
     assert_equal(['10', 'a', '+11'], @statistics.queues.map(&:name))
@@ -724,7 +724,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should count events in last minute" do
     prepare_event_counter_test(1, 9, 2.22)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     counter = @statistics.counters[0]
     assert_equal(9 * SLOTS_PER_MIN, counter.count)
@@ -734,7 +734,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should count events in last 5 minutes" do
     prepare_event_counter_test(5, 10, 3.33)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     counter = @statistics.counters[1]
     assert_equal(10 * SLOTS_PER_MIN * 5, counter.count)
@@ -744,7 +744,7 @@ class ProcessorTest < Test::Unit::TestCase
 
   test "should count events in last 15 minutes" do
     prepare_event_counter_test(15, 11, 4.44)
-    @statistics = Processor::Statistics.new(@redis)
+    @statistics = ProcessingQueue::Statistics.new(@redis)
 
     counter = @statistics.counters[2]
     assert_equal(11 * SLOTS_PER_MIN * 15, counter.count)

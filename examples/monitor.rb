@@ -1,6 +1,6 @@
 require 'curses'
 require 'redis'
-require 'processor'
+require 'processing_queue'
 
 class Header
   def initialize(message, top)
@@ -217,7 +217,7 @@ begin
   Curses.noecho
   Curses.curs_set(0)
 
-  stats = Processor::Statistics.new(Redis.new)
+  stats = ProcessingQueue::Statistics.new(Redis.new)
 
   header = Header.new('VMpay queue monitor', 0)
   events = Events.new(stats, 3)

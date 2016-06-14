@@ -1,7 +1,7 @@
-require 'processor'
+require 'processing_queue'
 require 'json'
 
-processor = Processor.new(Redis.new)
+processor = ProcessingQueue.new(Redis.new)
 worker = processor.worker
 worker.trap!
 
