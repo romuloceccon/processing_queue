@@ -673,37 +673,38 @@ class ProcessorTest < Test::Unit::TestCase
     assert_in_delta(60_000, operator.ttl, 50)
   end
 
-  test "should sort operators by numeric value" do
-    @redis.sadd('operators:known', 'a')
+  test "should sort operators by name" do
+    @redis.sadd('operators:known', '+11')
     @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', '+20')
+    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '{c}')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(3, @statistics.operators.count)
-    assert_equal(['a', '10', '+20'], @statistics.operators.map(&:name))
+    assert_equal(4, @statistics.operators.count)
+    assert_equal(['+11', '10', 'a', '{c}'], @statistics.operators.map(&:name))
   end
 
   test "should sort operators by queue length" do
-    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '+11')
     @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', '+20')
-    @redis.lpush('operators:+20:events', 'a')
+    @redis.sadd('operators:known', 'a')
+    @redis.lpush('operators:a:events', 'a')
     @statistics = Processor::Statistics.new(@redis)
 
     assert_equal(3, @statistics.operators.count)
-    assert_equal(['+20', 'a', '10'], @statistics.operators.map(&:name))
+    assert_equal(['a', '+11', '10'], @statistics.operators.map(&:name))
   end
 
   test "should sort operators by lock status" do
-    @redis.sadd('operators:known', 'a')
+    @redis.sadd('operators:known', '+11')
     @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', '+20')
-    @redis.lpush('operators:+20:events', 'a')
+    @redis.sadd('operators:known', 'a')
+    @redis.lpush('operators:a:events', 'a')
     @redis.set('operators:10:lock', '123/123')
     @statistics = Processor::Statistics.new(@redis)
 
     assert_equal(3, @statistics.operators.count)
-    assert_equal(['10', '+20', 'a'], @statistics.operators.map(&:name))
+    assert_equal(['10', 'a', '+11'], @statistics.operators.map(&:name))
   end
 
   test "should count events in last minute" do

@@ -266,7 +266,7 @@ EOS
       def <=>(other)
         return locked? ? -1 : 1 if locked? ^ other.locked?
         return other.count <=> count if count != other.count
-        return name.to_i <=> other.name.to_i
+        return name <=> other.name
       end
     end
 
