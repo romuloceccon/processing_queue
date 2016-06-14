@@ -147,30 +147,30 @@ class Operators
     @window.attroff(Curses::A_BOLD)
     @window.attroff(Curses::A_REVERSE)
 
-    @stats.operators.each_with_index do |operator, i|
+    @stats.queues.each_with_index do |queue, i|
       y = i + 1
       break if y >= @window.maxy
 
       @window.setpos(y, 0)
-      @window.addstr(operator.name)
+      @window.addstr(queue.name)
 
       @window.setpos(y, 9)
-      @window.addstr("%7d" % [operator.count])
+      @window.addstr("%7d" % [queue.count])
 
-      if operator.locked?
+      if queue.locked?
         @window.setpos(y, 18)
-        @window.addstr("%7s" % [operator.locked_by])
+        @window.addstr("%7s" % [queue.locked_by])
 
         @window.setpos(y, 27)
-        @window.addstr("%7d" % [operator.ttl])
+        @window.addstr("%7d" % [queue.ttl])
       end
 
-      if operator.queued?
+      if queue.queued?
         @window.setpos(y, 36 + 3)
         @window.addstr("X")
       end
 
-      if operator.taken?
+      if queue.taken?
         @window.setpos(y, 45 + 3)
         @window.addstr("X")
       end

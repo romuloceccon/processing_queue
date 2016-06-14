@@ -33,15 +33,15 @@ redis.call("INCRBYFLOAT", KEYS[1], ARGV[1])
 if not exists then redis.call("EXPIRE", KEYS[1], ARGV[2]) end
 EOS
 
-  EVENTS_MAIN_QUEUE = "events:queue".freeze
-  EVENTS_TEMP_QUEUE = "events:dispatching".freeze
+  INITIAL_QUEUE = "events:queue".freeze
+  DISPATCHING_EVENTS_LIST = "events:dispatching".freeze
 
   EVENTS_COUNTERS_RECEIVED = "events:counters:received"
   EVENTS_COUNTERS_PROCESSED = "events:counters:processed"
 
-  OPERATORS_QUEUE = "operators:queue".freeze
-  OPERATORS_TEMP = "operators:processing".freeze
-  OPERATORS_KNOWN_SET = "operators:known".freeze
+  WAITING_QUEUES_LIST = "queues:waiting".freeze
+  PROCESSING_QUEUES_LIST = "queues:processing".freeze
+  KNOWN_QUEUES_SET = "queues:known".freeze
 
   class Dispatcher
     def initialize(redis)
@@ -49,91 +49,91 @@ EOS
     end
 
     def dispatch_all(&block)
-      if @redis.exists(EVENTS_MAIN_QUEUE)
+      if @redis.exists(INITIAL_QUEUE)
         # Process queue safely: move master queue to a temporary one that won't
         # be touched by the workers. If this instance crashes the temporary
         # queue will be merged again to the master (see {Processor#dispatcher}).
-        @redis.rename(EVENTS_MAIN_QUEUE, EVENTS_TEMP_QUEUE)
-        list = prepare_events(EVENTS_TEMP_QUEUE, &block)
+        @redis.rename(INITIAL_QUEUE, DISPATCHING_EVENTS_LIST)
+        list = prepare_events(DISPATCHING_EVENTS_LIST, &block)
       else
         list = []
       end
 
-      abandoned_operators = find_abandoned_operators
+      abandoned_queues = find_abandoned_queues
 
       # Enqueue events and delete temporary queue atomically
       @redis.multi do
-        seen_operators = enqueue_events(list)
-        enqueue_abandoned_operators(abandoned_operators, seen_operators)
-        @redis.del(EVENTS_TEMP_QUEUE)
+        seen_queues = enqueue_events(list)
+        enqueue_abandoned_queues(abandoned_queues, seen_queues)
+        @redis.del(DISPATCHING_EVENTS_LIST)
       end
     end
 
     private
-      def prepare_events(queue_name)
-        cnt = @redis.llen(queue_name)
+      def prepare_events(list)
+        cnt = @redis.llen(list)
 
         (1..cnt).map do |i|
-          json = @redis.lindex(queue_name, -i)
+          json = @redis.lindex(list, -i)
           data = JSON.parse(json)
-          operator_id, object = yield(data)
-          [operator_id, object, data]
+          queue_id, object = yield(data)
+          [queue_id, object, data]
         end
       end
 
       def enqueue_events(events)
         result = []
 
-        events.each do |(operator_id, object, data)|
-          op_str = operator_id.to_s
+        events.each do |(queue_id, object, data)|
+          id_str = queue_id.to_s
 
-          # Keep a set of known operators. On restart/cleanup we need to scan
-          # for operator queues abandoned/locked by crashed workers (see below).
-          @redis.sadd(OPERATORS_KNOWN_SET, op_str)
-          unless result.include?(op_str)
-            @redis.lpush(OPERATORS_QUEUE, op_str)
-            result << op_str
+          # Keep a set of known queues. On restart/cleanup we need to scan for
+          # queues abandoned/locked by crashed workers (see below).
+          @redis.sadd(KNOWN_QUEUES_SET, id_str)
+          unless result.include?(id_str)
+            @redis.lpush(WAITING_QUEUES_LIST, id_str)
+            result << id_str
           end
 
           hsh = {}
           hsh['data'] = data
           hsh['object'] = object if object
-          @redis.lpush(Processor.operator_queue(op_str), hsh.to_json)
+          @redis.lpush(Processor.queue_events_list(id_str), hsh.to_json)
         end
 
         result
       end
 
-      def find_abandoned_operators
+      def find_abandoned_queues
         known, processing = @redis.multi do
-          @redis.smembers(OPERATORS_KNOWN_SET)
-          @redis.lrange(OPERATORS_TEMP, 0, -1)
+          @redis.smembers(KNOWN_QUEUES_SET)
+          @redis.lrange(PROCESSING_QUEUES_LIST, 0, -1)
         end
 
         keep_list = []
         abandoned = []
 
         processing.reverse.each do |x|
-          keep_list << (locked = @redis.exists(Processor.operator_lock(x)))
+          keep_list << (locked = @redis.exists(Processor.queue_lock(x)))
           abandoned << x if known.include?(x) && !locked
         end
         [keep_list, abandoned.uniq]
       end
 
-      def enqueue_abandoned_operators(abandoned_operators, ignore_list)
-        keep_list, abandoned = abandoned_operators
+      def enqueue_abandoned_queues(abandoned_queues, ignore_list)
+        keep_list, abandoned = abandoned_queues
 
         abandoned.each do |op_str|
           unless ignore_list.include?(op_str)
-            @redis.lpush(OPERATORS_QUEUE, op_str)
+            @redis.lpush(WAITING_QUEUES_LIST, op_str)
           end
         end
 
         keep_list.each do |keep|
           if keep
-            @redis.rpoplpush(OPERATORS_TEMP, OPERATORS_TEMP)
+            @redis.rpoplpush(PROCESSING_QUEUES_LIST, PROCESSING_QUEUES_LIST)
           else
-            @redis.rpop(OPERATORS_TEMP)
+            @redis.rpop(PROCESSING_QUEUES_LIST)
           end
         end
       end
@@ -151,14 +151,14 @@ EOS
       @trap_handler = @handler_exit
     end
 
-    def wait_for_operator
+    def wait_for_queue
       terminate if @interrupted
-      @redis.brpoplpush(OPERATORS_QUEUE, OPERATORS_TEMP)
+      @redis.brpoplpush(WAITING_QUEUES_LIST, PROCESSING_QUEUES_LIST)
     end
 
-    def process(operator)
-      queue = Processor.operator_queue(operator)
-      lock = Processor.operator_lock(operator)
+    def process(queue_id)
+      queue = Processor.queue_events_list(queue_id)
+      lock = Processor.queue_lock(queue_id)
 
       @trap_handler = @handler_flag
       begin
@@ -186,8 +186,8 @@ EOS
         end
 
         # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
-        @redis.evalsha(@clean_script, [lock, OPERATORS_KNOWN_SET, queue],
-          [@lock_id, operator])
+        @redis.evalsha(@clean_script, [lock, KNOWN_QUEUES_SET, queue],
+          [@lock_id, queue_id])
       ensure
         @trap_handler = @handler_exit
       end
@@ -237,16 +237,16 @@ EOS
   end
 
   class Statistics
-    class Operator
+    class Queue
       attr_reader :name, :count, :locked_by, :ttl
 
-      def initialize(redis, operator_id, queued_operators, processing_operators)
-        @name = operator_id
-        @count = redis.llen("operators:#{operator_id}:events")
-        @queued = queued_operators.include?(operator_id)
-        @processing = processing_operators.include?(operator_id)
+      def initialize(redis, queue_id, waiting_queues, processing_queues)
+        @name = queue_id
+        @count = redis.llen(Processor.queue_events_list(queue_id))
+        @queued = waiting_queues.include?(queue_id)
+        @processing = processing_queues.include?(queue_id)
 
-        lock_name = "operators:#{operator_id}:lock"
+        lock_name = Processor.queue_lock(queue_id)
         if lock = redis.get(lock_name)
           @locked_by = lock.split('/').last
           @ttl = redis.pttl(lock_name)
@@ -289,7 +289,7 @@ EOS
     end
 
     attr_reader :received_count, :processed_count, :waiting_count, :queue_length
-    attr_reader :operators
+    attr_reader :queues
     attr_reader :counters
 
     def initialize(redis)
@@ -300,21 +300,21 @@ EOS
     def update
       @received_count = @redis.get('events:counters:received').to_i
       @processed_count = @redis.get('events:counters:processed').to_i
-      @queue_length = @redis.llen('events:queue').to_i
+      @queue_length = @redis.llen(Processor::INITIAL_QUEUE).to_i
 
-      op_known, op_queued, op_processing = @redis.multi do
-        @redis.smembers('operators:known')
-        @redis.lrange('operators:queue', 0, -1)
-        @redis.lrange('operators:processing', 0, -1)
+      q_known, q_waiting, q_processing = @redis.multi do
+        @redis.smembers(Processor::KNOWN_QUEUES_SET)
+        @redis.lrange(Processor::WAITING_QUEUES_LIST, 0, -1)
+        @redis.lrange(Processor::PROCESSING_QUEUES_LIST, 0, -1)
       end
 
-      op_all = (op_known + op_queued + op_processing).uniq
-      @operators = op_all.map do |op_id|
-        Operator.new(@redis, op_id, op_queued, op_processing)
+      q_all = (q_known + q_waiting + q_processing).uniq
+      @queues = q_all.map do |q_id|
+        Queue.new(@redis, q_id, q_waiting, q_processing)
       end
-      @operators.sort!
+      @queues.sort!
 
-      @waiting_count = @operators.inject(0) { |r, obj| r + obj.count }
+      @waiting_count = @queues.inject(0) { |r, obj| r + obj.count }
 
       res = Processor::PERF_COUNTER_RESOLUTION
       t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -348,7 +348,7 @@ EOS
   def dispatcher
     return @dispatcher if @dispatcher
 
-    @redis.evalsha(@join_script, [EVENTS_TEMP_QUEUE, EVENTS_MAIN_QUEUE])
+    @redis.evalsha(@join_script, [DISPATCHING_EVENTS_LIST, INITIAL_QUEUE])
     @redis.set(EVENTS_COUNTERS_RECEIVED, "0")
     @redis.set(EVENTS_COUNTERS_PROCESSED, "0")
     @dispatcher = Dispatcher.new(@redis)
@@ -358,11 +358,11 @@ EOS
     return Worker.new(@redis)
   end
 
-  def self.operator_queue(id)
-    "operators:#{id}:events"
+  def self.queue_events_list(id)
+    "queues:#{id}:events"
   end
 
-  def self.operator_lock(id)
-    "operators:#{id}:lock"
+  def self.queue_lock(id)
+    "queues:#{id}:lock"
   end
 end

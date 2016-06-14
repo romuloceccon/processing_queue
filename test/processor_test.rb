@@ -64,7 +64,7 @@ class ProcessorTest < Test::Unit::TestCase
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
     processor.dispatcher.dispatch_all { [1, 1] }
 
-    assert_equal(["1"], @redis.smembers("operators:known"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
   end
 
   test "should hook redis methods" do
@@ -157,14 +157,14 @@ class ProcessorTest < Test::Unit::TestCase
       [10, 500]
     end
 
-    assert_equal(["10"], @redis.smembers("operators:known"))
+    assert_equal(["10"], @redis.smembers("queues:known"))
 
-    assert_equal(1, @redis.llen("operators:queue"))
-    assert_equal("10", @redis.rpop("operators:queue"))
+    assert_equal(1, @redis.llen("queues:waiting"))
+    assert_equal("10", @redis.rpop("queues:waiting"))
 
-    assert_equal(1, @redis.llen("operators:10:events"))
+    assert_equal(1, @redis.llen("queues:10:events"))
     assert_equal({ 'object' => 500, 'data' => { 'id' => 1 } },
-      JSON.parse(@redis.rpop("operators:10:events")))
+      JSON.parse(@redis.rpop("queues:10:events")))
   end
 
   test "should dispatch event without object" do
@@ -177,9 +177,9 @@ class ProcessorTest < Test::Unit::TestCase
       ['DISCARD', nil]
     end
 
-    assert_equal("DISCARD", @redis.rpop("operators:queue"))
+    assert_equal("DISCARD", @redis.rpop("queues:waiting"))
     assert_equal({ 'data' => { 'id' => 1 } },
-      JSON.parse(@redis.rpop("operators:DISCARD:events")))
+      JSON.parse(@redis.rpop("queues:DISCARD:events")))
   end
 
   test "should dispatch two events from different operators" do
@@ -192,14 +192,14 @@ class ProcessorTest < Test::Unit::TestCase
       [event['id'] * 10, event['id'] * 100]
     end
 
-    assert_equal(["20", "30"], @redis.smembers("operators:known"))
+    assert_equal(["20", "30"], @redis.smembers("queues:known"))
 
-    assert_equal(2, @redis.llen("operators:queue"))
-    assert_equal("20", @redis.rpop("operators:queue"))
-    assert_equal("30", @redis.rpop("operators:queue"))
+    assert_equal(2, @redis.llen("queues:waiting"))
+    assert_equal("20", @redis.rpop("queues:waiting"))
+    assert_equal("30", @redis.rpop("queues:waiting"))
 
     (2..3).each do |i|
-      k = "operators:#{i * 10}:events"
+      k = "queues:#{i * 10}:events"
       assert_equal(1, @redis.llen(k))
       assert_equal({ 'object' => i * 100, 'data' => { 'id' => i } },
         JSON.parse(@redis.rpop(k)))
@@ -216,12 +216,12 @@ class ProcessorTest < Test::Unit::TestCase
       [10, event['id'] * 100]
     end
 
-    assert_equal(["10"], @redis.smembers("operators:known"))
+    assert_equal(["10"], @redis.smembers("queues:known"))
 
-    assert_equal(1, @redis.llen("operators:queue"))
-    assert_equal("10", @redis.rpop("operators:queue"))
+    assert_equal(1, @redis.llen("queues:waiting"))
+    assert_equal("10", @redis.rpop("queues:waiting"))
 
-    k = "operators:10:events"
+    k = "queues:10:events"
     assert_equal(2, @redis.llen(k))
     (2..3).each do |i|
       assert_equal({ 'object' => i * 100, 'data' => { 'id' => i } },
@@ -273,7 +273,7 @@ class ProcessorTest < Test::Unit::TestCase
       end
     end
 
-    assert_equal(false, @redis.exists("operators:known"))
+    assert_equal(false, @redis.exists("queues:known"))
     assert_equal(0, @redis.llen("events:queue"))
     assert_equal(3, @redis.llen("events:dispatching"))
   end
@@ -290,99 +290,99 @@ class ProcessorTest < Test::Unit::TestCase
 
     assert_raises(Error) { dispatcher.dispatch_all { [1, 1] } }
 
-    assert_equal(0, @redis.llen("operators:queue"))
-    assert_equal(false, @redis.exists("operators:known"))
+    assert_equal(0, @redis.llen("queues:waiting"))
+    assert_equal(false, @redis.exists("queues:known"))
   end
 
   test "should reenqueue known processing operators at end of queue" do
     dispatcher = @processor.dispatcher
 
-    @redis.sadd("operators:known", "20")
-    @redis.lpush("operators:processing", "20")
+    @redis.sadd("queues:known", "20")
+    @redis.lpush("queues:processing", "20")
 
     @redis.lpush("events:queue", { "id" => 1 }.to_json)
     dispatcher.dispatch_all { [10, 100] }
 
-    assert_equal(["10", "20"], @redis.smembers("operators:known"))
+    assert_equal(["10", "20"], @redis.smembers("queues:known"))
 
-    assert_equal(["20", "10"], @redis.lrange("operators:queue", 0, -1))
-    assert_equal([], @redis.lrange("operators:processing", 0, -1))
+    assert_equal(["20", "10"], @redis.lrange("queues:waiting", 0, -1))
+    assert_equal([], @redis.lrange("queues:processing", 0, -1))
   end
 
   test "should not reenqueue already enqueued processing operator" do
     dispatcher = @processor.dispatcher
 
-    @redis.sadd("operators:known", "20")
-    @redis.lpush("operators:processing", "20")
+    @redis.sadd("queues:known", "20")
+    @redis.lpush("queues:processing", "20")
 
     @redis.lpush("events:queue", { "id" => 2 }.to_json)
     dispatcher.dispatch_all { [20, 200] }
 
-    assert_equal(["20"], @redis.smembers("operators:known"))
+    assert_equal(["20"], @redis.smembers("queues:known"))
 
-    assert_equal(["20"], @redis.lrange("operators:queue", 0, -1))
-    assert_equal([], @redis.lrange("operators:processing", 0, -1))
+    assert_equal(["20"], @redis.lrange("queues:waiting", 0, -1))
+    assert_equal([], @redis.lrange("queues:processing", 0, -1))
   end
 
   test "should reenqueue known processing operators even without events" do
     dispatcher = @processor.dispatcher
 
-    @redis.sadd("operators:known", "20")
-    @redis.lpush("operators:processing", "20")
+    @redis.sadd("queues:known", "20")
+    @redis.lpush("queues:processing", "20")
 
     dispatcher.dispatch_all { [0, 0] }
 
-    assert_equal(1, @redis.llen("operators:queue"))
-    assert_equal("20", @redis.rpop("operators:queue"))
+    assert_equal(1, @redis.llen("queues:waiting"))
+    assert_equal("20", @redis.rpop("queues:waiting"))
 
-    assert_equal(0, @redis.llen("operators:processing"))
+    assert_equal(0, @redis.llen("queues:processing"))
   end
 
   test "should not reenqueue unknown processing operators" do
     dispatcher = @processor.dispatcher
 
-    @redis.lpush("operators:processing", "20")
+    @redis.lpush("queues:processing", "20")
 
     @redis.lpush("events:queue", { "id" => 1 }.to_json)
     dispatcher.dispatch_all { [10, 100] }
 
-    assert_equal(1, @redis.llen("operators:queue"))
-    assert_equal("10", @redis.rpop("operators:queue"))
+    assert_equal(1, @redis.llen("queues:waiting"))
+    assert_equal("10", @redis.rpop("queues:waiting"))
 
-    assert_equal(0, @redis.llen("operators:processing"))
+    assert_equal(0, @redis.llen("queues:processing"))
   end
 
   test "should not delete processing operator added during event dispatching" do
     wrapper = Wrapper.new(@redis)
     dispatcher = Processor.new(wrapper).dispatcher
 
-    @redis.sadd("operators:known", "10")
-    @redis.sadd("operators:known", "20")
+    @redis.sadd("queues:known", "10")
+    @redis.sadd("queues:known", "20")
 
     redis_aux = Redis.new(db: 15)
     wrapper.before(:sadd) do |*args|
-      redis_aux.lpush("operators:processing", "20")
+      redis_aux.lpush("queues:processing", "20")
     end
 
-    @redis.lpush("operators:processing", "10")
+    @redis.lpush("queues:processing", "10")
     @redis.lpush("events:queue", { "id" => 3 }.to_json)
     dispatcher.dispatch_all { [30, 300] }
 
-    assert_equal(1, @redis.llen("operators:processing"))
-    assert_equal("20", @redis.rpop("operators:processing"))
+    assert_equal(1, @redis.llen("queues:processing"))
+    assert_equal("20", @redis.rpop("queues:processing"))
   end
 
   test "should ignore locked processing operator" do
     dispatcher = @processor.dispatcher
 
-    @redis.sadd("operators:known", "20")
-    @redis.lpush("operators:processing", "20")
-    @redis.set("operators:20:lock", "abc")
+    @redis.sadd("queues:known", "20")
+    @redis.lpush("queues:processing", "20")
+    @redis.set("queues:20:lock", "abc")
 
     dispatcher.dispatch_all { [0, 0] }
 
-    assert_equal([], @redis.lrange("operators:queue", 0, -1))
-    assert_equal(["20"], @redis.lrange("operators:processing", 0, -1))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+    assert_equal(["20"], @redis.lrange("queues:processing", 0, -1))
   end
 
   test "should reenqueue processing operators while ignoring locked ones" do
@@ -390,15 +390,15 @@ class ProcessorTest < Test::Unit::TestCase
 
     (1..4).each do |i|
       op = (i * 10).to_s
-      @redis.sadd("operators:known", op)
-      @redis.lpush("operators:processing", op)
+      @redis.sadd("queues:known", op)
+      @redis.lpush("queues:processing", op)
     end
-    @redis.set("operators:20:lock", "abc")
-    @redis.set("operators:40:lock", "def")
+    @redis.set("queues:20:lock", "abc")
+    @redis.set("queues:40:lock", "def")
 
     dispatcher.dispatch_all { [0, 0] }
-    assert_equal(["30", "10"], @redis.lrange("operators:queue", 0, -1))
-    assert_equal(["40", "20"], @redis.lrange("operators:processing", 0, -1))
+    assert_equal(["30", "10"], @redis.lrange("queues:waiting", 0, -1))
+    assert_equal(["40", "20"], @redis.lrange("queues:processing", 0, -1))
   end
 
   # ----- worker unit tests -----
@@ -406,19 +406,19 @@ class ProcessorTest < Test::Unit::TestCase
   test "should get operator from queue" do
     worker = @processor.worker
 
-    @redis.lpush("operators:queue", "1")
-    assert_equal("1", worker.wait_for_operator)
+    @redis.lpush("queues:waiting", "1")
+    assert_equal("1", worker.wait_for_queue)
 
-    assert_equal([], @redis.lrange("operators:queue", 0, -1))
-    assert_equal(["1"], @redis.lrange("operators:processing", 0, -1))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+    assert_equal(["1"], @redis.lrange("queues:processing", 0, -1))
   end
 
   test "should process multiple events" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     cnt = 0
     worker.process("1") do |events|
@@ -429,32 +429,32 @@ class ProcessorTest < Test::Unit::TestCase
     end
 
     assert_equal(2, cnt)
-    assert_equal([], @redis.smembers("operators:known"))
-    assert_equal(0, @redis.llen("operators:1:events"))
-    assert_equal(false, @redis.exists("operators:1:lock"))
+    assert_equal([], @redis.smembers("queues:known"))
+    assert_equal(0, @redis.llen("queues:1:events"))
+    assert_equal(false, @redis.exists("queues:1:lock"))
   end
 
   test "should not change queue while processing events" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     worker.process("1") do |events|
-      assert_equal(2, @redis.llen("operators:1:events"))
+      assert_equal(2, @redis.llen("queues:1:events"))
       events.each {}
-      assert_equal(2, @redis.llen("operators:1:events"))
+      assert_equal(2, @redis.llen("queues:1:events"))
     end
-    assert_equal(0, @redis.llen("operators:1:events"))
+    assert_equal(0, @redis.llen("queues:1:events"))
   end
 
   test "should increment processed event counter" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     worker.process("1") { |events| events.each {} }
 
@@ -464,138 +464,138 @@ class ProcessorTest < Test::Unit::TestCase
   test "should lock operator before processing" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
     assert_raises(Error) do
       worker.process("1") { |events| events.each { raise Error, "abort" } }
     end
 
-    assert_equal(1, @redis.llen("operators:1:events"))
+    assert_equal(1, @redis.llen("queues:1:events"))
     assert_match(/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}\/#{Process.pid}$/,
-      @redis.get("operators:1:lock"))
+      @redis.get("queues:1:lock"))
   end
 
   test "should lock operator with timeout" do
     worker = @processor.worker
 
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
     assert_raises(Error) do
       worker.process("1") { |events| events.each { raise Error, "abort" } }
     end
 
-    assert_in_delta(300_000, @redis.pttl("operators:1:lock"), 100)
+    assert_in_delta(300_000, @redis.pttl("queues:1:lock"), 100)
   end
 
   test "should not process events if operator is locked" do
     worker = @processor.worker
 
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.set("operators:1:lock", "1234")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.set("queues:1:lock", "1234")
 
     cnt = 0
     worker.process("1") { |events| events.each { cnt += 1 } }
 
     assert_equal(0, cnt)
-    assert_equal(1, @redis.llen("operators:1:events"))
+    assert_equal(1, @redis.llen("queues:1:events"))
   end
 
   test "should not unlock lock from another worker" do
     wrapper = Wrapper.new(@redis)
     worker = Processor.new(wrapper).worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
 
-    wrapper.before(:rpop) { @redis.set("operators:1:lock", "1234") }
+    wrapper.before(:rpop) { @redis.set("queues:1:lock", "1234") }
     worker.process("1") { |events| events.each {} }
 
-    assert_equal("1234", @redis.get("operators:1:lock"))
+    assert_equal("1234", @redis.get("queues:1:lock"))
   end
 
   test "should not remove operator from known set if queue is not empty" do
     wrapper = Wrapper.new(@redis)
     worker = Processor.new(wrapper).worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
 
     wrapper.before(:multi) do
-      @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+      @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
     end
     worker.process("1") { |events| events.each {} }
 
-    assert_equal(["1"], @redis.smembers("operators:known"))
-    assert_equal(1, @redis.llen("operators:1:events"))
-    assert_equal(false, @redis.exists("operators:1:lock"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
+    assert_equal(1, @redis.llen("queues:1:events"))
+    assert_equal(false, @redis.exists("queues:1:lock"))
   end
 
   test "should stop processing if interrupted" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     worker.process("1") do |events|
       events.each { worker.instance_variable_set(:@interrupted, 1) }
     end
 
-    assert_equal(["1"], @redis.smembers("operators:known"))
-    assert_equal(1, @redis.llen("operators:1:events"))
-    assert_equal(false, @redis.exists("operators:1:lock"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
+    assert_equal(1, @redis.llen("queues:1:events"))
+    assert_equal(false, @redis.exists("queues:1:lock"))
   end
 
   test "should continue processing if new events arrive after batch starts" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
-    @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
-    @redis.lpush("operators:1:events", { 'val' => 2 }.to_json)
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     cnt = 0
     worker.process("1") do |events|
       events.each do |event|
         cnt += 1
         if cnt == 2
-          @redis.lpush("operators:1:events", { 'val' => 3 }.to_json)
-          @redis.lpush("operators:1:events", { 'val' => 4 }.to_json)
+          @redis.lpush("queues:1:events", { 'val' => 3 }.to_json)
+          @redis.lpush("queues:1:events", { 'val' => 4 }.to_json)
         end
       end
     end
 
     assert_equal(4, cnt)
-    assert_equal([], @redis.smembers("operators:known"))
-    assert_equal(0, @redis.llen("operators:1:events"))
+    assert_equal([], @redis.smembers("queues:known"))
+    assert_equal(0, @redis.llen("queues:1:events"))
   end
 
   test "should limit worker batch size" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
+    @redis.sadd("queues:known", "1")
     (1..150).each do |i|
-      @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+      @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
     end
 
     cnt = 0
     worker.process("1") { |events| events.each { cnt += 1 } }
 
     assert_equal(100, cnt)
-    assert_equal(["1"], @redis.smembers("operators:known"))
-    assert_equal(50, @redis.llen("operators:1:events"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
+    assert_equal(50, @redis.llen("queues:1:events"))
   end
 
   test "should be able to break from processing" do
     worker = @processor.worker
 
-    @redis.sadd("operators:known", "1")
+    @redis.sadd("queues:known", "1")
     (1..3).each do |i|
-      @redis.lpush("operators:1:events", { 'val' => 1 }.to_json)
+      @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
     end
 
     worker.process("1") { |events| events.each { break } }
 
-    assert_equal(["1"], @redis.smembers("operators:known"))
-    assert_equal(2, @redis.llen("operators:1:events"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
+    assert_equal(2, @redis.llen("queues:1:events"))
   end
 
   # ----- statistics unit tests -----
@@ -622,104 +622,104 @@ class ProcessorTest < Test::Unit::TestCase
   end
 
   test "should get known operator status" do
-    @redis.sadd('operators:known', '1')
+    @redis.sadd("queues:known", '1')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(1, @statistics.operators.count)
-    operator = @statistics.operators.first
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
     assert_false(operator.queued?)
     assert_false(operator.taken?)
   end
 
   test "should get queued operator status" do
-    @redis.sadd('operators:known', '1')
-    @redis.lpush('operators:queue', '1')
+    @redis.sadd("queues:known", '1')
+    @redis.lpush("queues:waiting", '1')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(1, @statistics.operators.count)
-    operator = @statistics.operators.first
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
     assert_false(operator.locked?)
     assert_true(operator.queued?)
     assert_false(operator.taken?)
   end
 
   test "should get processing operator status" do
-    @redis.sadd('operators:known', '1')
-    @redis.lpush('operators:processing', '1')
+    @redis.sadd("queues:known", '1')
+    @redis.lpush("queues:processing", '1')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(1, @statistics.operators.count)
-    operator = @statistics.operators.first
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
     assert_false(operator.locked?)
     assert_false(operator.queued?)
     assert_true(operator.taken?)
   end
 
   test "should calculate operator queue length" do
-    @redis.sadd('operators:known', '1')
-    ('a'..'c').each { |c| @redis.lpush('operators:1:events', c) }
+    @redis.sadd("queues:known", '1')
+    ('a'..'c').each { |c| @redis.lpush("queues:1:events", c) }
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(1, @statistics.operators.count)
-    operator = @statistics.operators.first
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
     assert_equal(3, operator.count)
   end
 
   test "should calculate waiting event count" do
-    @redis.sadd('operators:known', '1')
-    ('a'..'c').each { |c| @redis.lpush('operators:1:events', c) }
-    @redis.sadd('operators:known', '2')
-    ('d'..'e').each { |c| @redis.lpush('operators:2:events', c) }
+    @redis.sadd("queues:known", '1')
+    ('a'..'c').each { |c| @redis.lpush("queues:1:events", c) }
+    @redis.sadd("queues:known", '2')
+    ('d'..'e').each { |c| @redis.lpush("queues:2:events", c) }
     @statistics = Processor::Statistics.new(@redis)
 
     assert_equal(5, @statistics.waiting_count)
   end
 
   test "should show operator lock status" do
-    @redis.sadd('operators:known', '1')
-    @redis.set('operators:1:lock', '1234567890/1500')
-    @redis.pexpire('operators:1:lock', 60_000)
+    @redis.sadd("queues:known", '1')
+    @redis.set("queues:1:lock", '1234567890/1500')
+    @redis.pexpire("queues:1:lock", 60_000)
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(1, @statistics.operators.count)
-    operator = @statistics.operators.first
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
     assert_true(operator.locked?)
     assert_equal('1500', operator.locked_by)
     assert_in_delta(60_000, operator.ttl, 50)
   end
 
   test "should sort operators by name" do
-    @redis.sadd('operators:known', '+11')
-    @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', 'a')
-    @redis.sadd('operators:known', '{c}')
+    @redis.sadd("queues:known", '+11')
+    @redis.sadd("queues:known", '10')
+    @redis.sadd("queues:known", 'a')
+    @redis.sadd("queues:known", '{c}')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(4, @statistics.operators.count)
-    assert_equal(['+11', '10', 'a', '{c}'], @statistics.operators.map(&:name))
+    assert_equal(4, @statistics.queues.count)
+    assert_equal(['+11', '10', 'a', '{c}'], @statistics.queues.map(&:name))
   end
 
   test "should sort operators by queue length" do
-    @redis.sadd('operators:known', '+11')
-    @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', 'a')
-    @redis.lpush('operators:a:events', 'a')
+    @redis.sadd("queues:known", '+11')
+    @redis.sadd("queues:known", '10')
+    @redis.sadd("queues:known", 'a')
+    @redis.lpush("queues:a:events", 'a')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(3, @statistics.operators.count)
-    assert_equal(['a', '+11', '10'], @statistics.operators.map(&:name))
+    assert_equal(3, @statistics.queues.count)
+    assert_equal(['a', '+11', '10'], @statistics.queues.map(&:name))
   end
 
   test "should sort operators by lock status" do
-    @redis.sadd('operators:known', '+11')
-    @redis.sadd('operators:known', '10')
-    @redis.sadd('operators:known', 'a')
-    @redis.lpush('operators:a:events', 'a')
-    @redis.set('operators:10:lock', '123/123')
+    @redis.sadd("queues:known", '+11')
+    @redis.sadd("queues:known", '10')
+    @redis.sadd("queues:known", 'a')
+    @redis.lpush("queues:a:events", 'a')
+    @redis.set("queues:10:lock", '123/123')
     @statistics = Processor::Statistics.new(@redis)
 
-    assert_equal(3, @statistics.operators.count)
-    assert_equal(['10', 'a', '+11'], @statistics.operators.map(&:name))
+    assert_equal(3, @statistics.queues.count)
+    assert_equal(['10', 'a', '+11'], @statistics.queues.map(&:name))
   end
 
   test "should count events in last minute" do

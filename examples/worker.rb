@@ -6,7 +6,7 @@ worker = processor.worker
 worker.trap!
 
 loop do
-  operator = worker.wait_for_operator
+  operator = worker.wait_for_queue
   puts("Processing operator %s" % [operator])
   cnt = 0
   worker.process(operator) do |events|
