@@ -2,133 +2,35 @@ require 'curses'
 require 'redis'
 require 'processor'
 
-class Stats
-  attr_reader :events_received, :events_processed, :events_queued,
-    :events_waiting, :operators, :counter_times, :counter_counts
-
-  class Operator
-    attr_reader :name, :count, :locked_by, :ttl
-
-    def initialize(redis, operator_id, op_queued, op_processing)
-      @name = operator_id
-      @count = redis.llen("operators:#{operator_id}:events")
-      lock_name = "operators:#{operator_id}:lock"
-      if lock = redis.get(lock_name)
-        @locked = true
-        @locked_by = lock.split('/').last
-        @ttl = redis.pttl(lock_name)
-      end
-      @queued = op_queued.include?(operator_id)
-      @taken = op_processing.include?(operator_id)
-    end
-
-    def locked?
-      return @locked
-    end
-
-    def queued?
-      return @queued
-    end
-
-    def taken?
-      return @taken
-    end
-
-    def <=>(other)
-      return locked? ? -1 : 1 if locked? ^ other.locked?
-      return other.count <=> count if count != other.count
-
-      return name.to_i <=> other.name.to_i
-    end
-  end
-
-  def initialize
-    @redis = Redis.new
-    update
-  end
-
-  def update
-    @events_received = @redis.get('events:counters:received').to_i
-    @events_processed = @redis.get('events:counters:processed').to_i
-    @events_queued = @redis.llen('events:queue')
-
-    op_known, op_queued, op_processing = @redis.multi do
-      @redis.smembers('operators:known')
-      @redis.lrange('operators:queue', 0, -1)
-      @redis.lrange('operators:processing', 0, -1)
-    end
-
-    all = (op_known + op_queued + op_processing).uniq
-
-    @operators = all.map do |operator_id|
-      Operator.new(@redis, operator_id, op_queued, op_processing)
-    end
-    @operators.sort!
-
-    @events_waiting = @operators.inject(0) { |r, obj| r + obj.count }
-
-    res = Processor::PERF_COUNTER_RESOLUTION
-
-    t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    slot = (t / res).to_i
-    values = @redis.multi do
-      slot.downto(slot - 900 / res + 1).each do |s|
-        @redis.get("events:counters:#{s}:time")
-        @redis.get("events:counters:#{s}:count")
-      end
-    end
-
-    @counter_times = [0.0, 0.0, 0.0]
-    @counter_counts = [0, 0, 0]
-    # 1 min, 5 min, 15 min
-    [60, 300, 900].each_with_index do |t, i|
-      cnt = t / res
-      0.upto(cnt - 1).each do |p|
-        @counter_times[i] += values[p * 2].to_f
-        @counter_counts[i] += values[p * 2 + 1].to_i
-      end
-      @counter_times[i] /= t
-      @counter_counts[i] /= (t / 60)
-    end
-  end
-end
-
 class Header
   def initialize(message, top)
     @top = top
     @cols = Curses.cols
     @message = message
-    @window = Curses::Window.new(3, @cols, @top, 0)
 
-    update_window
-    @window.refresh
+    @window = Curses::Window.new(3, @cols, @top, 0)
   end
 
-  def update
-    if @cols != Curses.cols
-      @cols = Curses.cols
-      @window.resize(3, @cols)
+  def resize
+    @cols = Curses.cols
+    @window.resize(3, @cols)
+  end
 
-      update_window
-      @window.refresh
-    end
+  def refresh
+    @window.clear
+
+    x = [(@cols - @message.size) / 2, 0].max
+    @window.setpos(0, x)
+    @window.addstr(@message[0..[@cols - 1, @message.size - 1].min])
+
+    @window.setpos(1, 0)
+    @window.addstr("=" * @cols)
+    @window.noutrefresh
   end
 
   def close
     @window.close
   end
-
-  private
-    def update_window
-      @window.clear
-
-      x = [(@cols - @message.size) / 2, 0].max
-      @window.setpos(0, x)
-      @window.addstr(@message[0..[@cols - 1, @message.size - 1].min])
-
-      @window.setpos(1, 0)
-      @window.addstr("=" * @cols)
-    end
 end
 
 class Events
@@ -139,33 +41,37 @@ class Events
     @window = Curses::Window.new(1, 80, @top, 0)
   end
 
-  def update
+  def resize
+
+  end
+
+  def refresh
     @window.clear
 
     @window.setpos(0, 0)
     @window.addstr('Events: ')
 
     @window.attron(Curses::A_BOLD)
-    @window.addstr('%6d' % [@stats.events_received])
+    @window.addstr('%6d' % [@stats.received_count])
     @window.attroff(Curses::A_BOLD)
     @window.addstr(' received, ')
 
     @window.attron(Curses::A_BOLD)
-    @window.addstr('%6d' % [@stats.events_queued])
+    @window.addstr('%6d' % [@stats.queue_length])
     @window.attroff(Curses::A_BOLD)
     @window.addstr(' queued, ')
 
     @window.attron(Curses::A_BOLD)
-    @window.addstr('%6d' % [@stats.events_waiting])
+    @window.addstr('%6d' % [@stats.waiting_count])
     @window.attroff(Curses::A_BOLD)
     @window.addstr(' waiting, ')
 
     @window.attron(Curses::A_BOLD)
-    @window.addstr('%6d' % [@stats.events_processed])
+    @window.addstr('%6d' % [@stats.processed_count])
     @window.attroff(Curses::A_BOLD)
     @window.addstr(' processed')
 
-    @window.refresh
+    @window.noutrefresh
   end
 
   def close
@@ -181,7 +87,11 @@ class Performance
     @window = Curses::Window.new(2, 80, @top, 0)
   end
 
-  def update
+  def resize
+
+  end
+
+  def refresh
     @window.clear
 
     @window.setpos(0, 0)
@@ -189,7 +99,7 @@ class Performance
 
     @window.attron(Curses::A_BOLD)
     (0..2).each do |i|
-      @window.addstr('%10.2f' % [@stats.counter_times[i]])
+      @window.addstr('%10.2f' % [@stats.counters[i].time_busy])
     end
     @window.attroff(Curses::A_BOLD)
 
@@ -198,11 +108,11 @@ class Performance
 
     @window.attron(Curses::A_BOLD)
     (0..2).each do |i|
-      @window.addstr('%10d' % [@stats.counter_counts[i]])
+      @window.addstr('%10d' % [@stats.counters[i].count_per_min])
     end
     @window.attroff(Curses::A_BOLD)
 
-    @window.refresh
+    @window.noutrefresh
   end
 
   def close
@@ -220,12 +130,12 @@ class Operators
     @window.timeout = 1000
   end
 
-  def update
-    if @lines != Curses.lines || @cols != Curses.cols
-      @cols, @lines = Curses.cols, Curses.lines
-      @window.resize(@lines - @top, @cols)
-    end
+  def resize
+    @cols, @lines = Curses.cols, Curses.lines
+    @window.resize(@lines - @top, @cols)
+  end
 
+  def refresh
     @window.clear
     @window.setpos(0, 0)
 
@@ -266,15 +176,38 @@ class Operators
       end
     end
 
-    @window.refresh
+    @window.noutrefresh
   end
 
-  def wait
-    @window.getch == 'q'
+  def get_key
+    @window.getch
   end
 
   def close
     @window.close
+  end
+end
+
+class WindowList
+  def initialize(windows, main)
+    @windows = windows
+    @main = main
+  end
+
+  def close
+    @windows.each(&:close)
+  end
+
+  def get_key
+    @main.get_key
+  end
+
+  def refresh
+    @windows.each(&:refresh)
+  end
+
+  def resize
+    @windows.each(&:resize)
   end
 end
 
@@ -284,29 +217,27 @@ begin
   Curses.noecho
   Curses.curs_set(0)
 
-  stats = Stats.new
+  stats = Processor::Statistics.new(Redis.new)
 
   header = Header.new('VMpay queue monitor', 0)
   events = Events.new(stats, 3)
   performance = Performance.new(stats, 4)
   operators = Operators.new(stats, 7)
+  windows = WindowList.new([header, events, performance, operators], operators)
 
   begin
     loop do
       stats.update
 
-      header.update
-      events.update
-      performance.update
-      operators.update
+      windows.refresh
+      Curses.doupdate
 
-      break if operators.wait
+      key = windows.get_key
+      break if key == 'q'
+      windows.resize if key == Curses::Key::RESIZE
     end
   ensure
-    header.close
-    events.close
-    performance.close
-    operators.close
+    windows.close
   end
 ensure
   Curses.close_screen
