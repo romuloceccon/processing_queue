@@ -95,8 +95,10 @@ EOS
             result << op_str
           end
 
-          @redis.lpush(Processor.operator_queue(op_str),
-            { 'object' => object, 'data' => data }.to_json)
+          hsh = {}
+          hsh['data'] = data
+          hsh['object'] = object if object
+          @redis.lpush(Processor.operator_queue(op_str), hsh.to_json)
         end
 
         result

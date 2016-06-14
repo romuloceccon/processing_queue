@@ -167,6 +167,21 @@ class ProcessorTest < Test::Unit::TestCase
       JSON.parse(@redis.rpop("operators:10:events")))
   end
 
+  test "should dispatch event without object" do
+    dispatcher = @processor.dispatcher
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+
+    dispatcher.dispatch_all do |event|
+      assert_equal({ 'id' => 1 }, event)
+      ['DISCARD', nil]
+    end
+
+    assert_equal("DISCARD", @redis.rpop("operators:queue"))
+    assert_equal({ 'data' => { 'id' => 1 } },
+      JSON.parse(@redis.rpop("operators:DISCARD:events")))
+  end
+
   test "should dispatch two events from different operators" do
     dispatcher = @processor.dispatcher
 
