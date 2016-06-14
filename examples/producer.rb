@@ -5,8 +5,10 @@ redis = Redis.new
 
 loop do
   n = rand(5000)
-  redis.lpush(Processor::EVENTS_MAIN_QUEUE, [n].to_json)
-  redis.incr(Processor::EVENTS_COUNTERS_RECEIVED)
+  redis.multi do
+    redis.lpush(Processor::EVENTS_MAIN_QUEUE, [n].to_json)
+    redis.incr(Processor::EVENTS_COUNTERS_RECEIVED)
+  end
   puts(n.to_s)
   Kernel.sleep(0.02)
 end
