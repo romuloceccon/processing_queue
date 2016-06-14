@@ -13,7 +13,7 @@ loop do
     # begin tran
     events.each do |event|
       cnt += 1
-      puts("inst %3d  ev %5d" % [event['installation_id'], event['data'].first])
+      puts("inst %3d  ev %5d" % [event['object'], event['data'].first])
       Kernel.sleep(0.02 + rand * 0.04)
     end
     puts("Processed: %d events" % cnt)

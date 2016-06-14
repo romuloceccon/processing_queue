@@ -163,7 +163,7 @@ class ProcessorTest < Test::Unit::TestCase
     assert_equal("10", @redis.rpop("operators:queue"))
 
     assert_equal(1, @redis.llen("operators:10:events"))
-    assert_equal({ 'installation_id' => 500, 'data' => { 'id' => 1 } },
+    assert_equal({ 'object' => 500, 'data' => { 'id' => 1 } },
       JSON.parse(@redis.rpop("operators:10:events")))
   end
 
@@ -186,7 +186,7 @@ class ProcessorTest < Test::Unit::TestCase
     (2..3).each do |i|
       k = "operators:#{i * 10}:events"
       assert_equal(1, @redis.llen(k))
-      assert_equal({ 'installation_id' => i * 100, 'data' => { 'id' => i } },
+      assert_equal({ 'object' => i * 100, 'data' => { 'id' => i } },
         JSON.parse(@redis.rpop(k)))
     end
   end
@@ -209,7 +209,7 @@ class ProcessorTest < Test::Unit::TestCase
     k = "operators:10:events"
     assert_equal(2, @redis.llen(k))
     (2..3).each do |i|
-      assert_equal({ 'installation_id' => i * 100, 'data' => { 'id' => i } },
+      assert_equal({ 'object' => i * 100, 'data' => { 'id' => i } },
         JSON.parse(@redis.rpop(k)))
     end
   end

@@ -76,15 +76,15 @@ EOS
         (1..cnt).map do |i|
           json = @redis.lindex(queue_name, -i)
           data = JSON.parse(json)
-          operator_id, installation_id = yield(data)
-          [operator_id, installation_id, data]
+          operator_id, object = yield(data)
+          [operator_id, object, data]
         end
       end
 
       def enqueue_events(events)
         result = []
 
-        events.each do |(operator_id, installation_id, data)|
+        events.each do |(operator_id, object, data)|
           op_str = operator_id.to_s
 
           # Keep a set of known operators. On restart/cleanup we need to scan
@@ -96,7 +96,7 @@ EOS
           end
 
           @redis.lpush(Processor.operator_queue(op_str),
-            { 'installation_id' => installation_id, 'data' => data }.to_json)
+            { 'object' => object, 'data' => data }.to_json)
         end
 
         result
