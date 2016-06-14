@@ -145,6 +145,7 @@ EOS
       @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
       @inc_counter_script = @redis.script('LOAD', LUA_INC_PERF_COUNTER)
+      @interrupted = nil
 
       @handler_flag = proc { |val| @interrupted = val }
       @handler_exit = proc { |val| @interrupted = val; terminate }
@@ -245,6 +246,7 @@ EOS
         @count = redis.llen(Processor.queue_events_list(queue_id))
         @queued = waiting_queues.include?(queue_id)
         @processing = processing_queues.include?(queue_id)
+        @locked_by = @ttl = nil
 
         lock_name = Processor.queue_lock(queue_id)
         if lock = redis.get(lock_name)
@@ -342,6 +344,7 @@ EOS
 
   def initialize(redis)
     @redis = redis
+    @dispatcher = nil
     @join_script = @redis.script('LOAD', LUA_JOIN_LISTS)
   end
 
