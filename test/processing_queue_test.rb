@@ -91,12 +91,12 @@ class ProcessingQueueTest < Test::Unit::TestCase
   end
 
   test "should initialize event counters" do
-    @redis.set("events:counters:received", "1")
+    @redis.set("events:counters:dispatched", "1")
     @redis.set("events:counters:processed", "1")
 
     @processor.dispatcher
 
-    assert_equal("0", @redis.get("events:counters:received"))
+    assert_equal("0", @redis.get("events:counters:dispatched"))
     assert_equal("0", @redis.get("events:counters:processed"))
   end
 
@@ -165,6 +165,15 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("queues:10:events"))
     assert_equal({ 'object' => 500, 'data' => { 'id' => 1 } },
       JSON.parse(@redis.rpop("queues:10:events")))
+  end
+
+  test "should increment dispatched event counter" do
+    dispatcher = @processor.dispatcher
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+    dispatcher.dispatch_all { |event| [10, 500] }
+
+    assert_equal(1, @redis.get("events:counters:dispatched").to_i)
   end
 
   test "should dispatch event without object" do
@@ -601,7 +610,8 @@ class ProcessingQueueTest < Test::Unit::TestCase
   # ----- statistics unit tests -----
 
   test "should count received events" do
-    @redis.set('events:counters:received', 7)
+    @redis.set('events:counters:dispatched', 4)
+    ('a'..'c').each { |c| @redis.lpush('events:queue', c) }
     @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(7, @statistics.received_count)

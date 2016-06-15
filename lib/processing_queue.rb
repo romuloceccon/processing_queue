@@ -36,8 +36,8 @@ EOS
   INITIAL_QUEUE = "events:queue".freeze
   DISPATCHING_EVENTS_LIST = "events:dispatching".freeze
 
-  EVENTS_COUNTERS_RECEIVED = "events:counters:received"
-  EVENTS_COUNTERS_PROCESSED = "events:counters:processed"
+  EVENTS_COUNTERS_DISPATCHED = "events:counters:dispatched".freeze
+  EVENTS_COUNTERS_PROCESSED = "events:counters:processed".freeze
 
   WAITING_QUEUES_LIST = "queues:waiting".freeze
   PROCESSING_QUEUES_LIST = "queues:processing".freeze
@@ -99,6 +99,7 @@ EOS
           hsh['data'] = data
           hsh['object'] = object if object
           @redis.lpush(ProcessingQueue.queue_events_list(id_str), hsh.to_json)
+          @redis.incr(EVENTS_COUNTERS_DISPATCHED)
         end
 
         result
@@ -285,12 +286,13 @@ EOS
 
       private
         def sum_recent_counters(arr, secs)
-          arr.slice(0, secs / ProcessingQueue::PERF_COUNTER_RESOLUTION).
+          arr.slice(0, secs / PERF_COUNTER_RESOLUTION).
             inject(0) { |acc, x| acc + x }
         end
     end
 
-    attr_reader :received_count, :processed_count, :waiting_count, :queue_length
+    attr_reader :received_count, :dispatched_count, :processed_count
+    attr_reader :waiting_count, :queue_length
     attr_reader :queues
     attr_reader :counters
 
@@ -300,25 +302,30 @@ EOS
     end
 
     def update
-      @received_count = @redis.get('events:counters:received').to_i
-      @processed_count = @redis.get('events:counters:processed').to_i
-      @queue_length = @redis.llen(ProcessingQueue::INITIAL_QUEUE).to_i
+      disp_cnt, proc_cnt, q_len, q_known, q_waiting, q_proc = @redis.multi do
+        @redis.get(EVENTS_COUNTERS_DISPATCHED)
+        @redis.get(EVENTS_COUNTERS_PROCESSED)
+        @redis.llen(INITIAL_QUEUE)
 
-      q_known, q_waiting, q_processing = @redis.multi do
-        @redis.smembers(ProcessingQueue::KNOWN_QUEUES_SET)
-        @redis.lrange(ProcessingQueue::WAITING_QUEUES_LIST, 0, -1)
-        @redis.lrange(ProcessingQueue::PROCESSING_QUEUES_LIST, 0, -1)
+        @redis.smembers(KNOWN_QUEUES_SET)
+        @redis.lrange(WAITING_QUEUES_LIST, 0, -1)
+        @redis.lrange(PROCESSING_QUEUES_LIST, 0, -1)
       end
 
-      q_all = (q_known + q_waiting + q_processing).uniq
+      @dispatched_count, @processed_count, @queue_length =
+        disp_cnt.to_i, proc_cnt.to_i, q_len.to_i
+
+      @received_count = @dispatched_count + @queue_length
+
+      q_all = (q_known + q_waiting + q_proc).uniq
       @queues = q_all.map do |q_id|
-        Queue.new(@redis, q_id, q_waiting, q_processing)
+        Queue.new(@redis, q_id, q_waiting, q_proc)
       end
       @queues.sort!
 
       @waiting_count = @queues.inject(0) { |r, obj| r + obj.count }
 
-      res = ProcessingQueue::PERF_COUNTER_RESOLUTION
+      res = PERF_COUNTER_RESOLUTION
       t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       cur_slot = (t / res).to_i
       slot_cnt = (900 / res).to_i
@@ -352,7 +359,7 @@ EOS
     return @dispatcher if @dispatcher
 
     @redis.evalsha(@join_script, [DISPATCHING_EVENTS_LIST, INITIAL_QUEUE])
-    @redis.set(EVENTS_COUNTERS_RECEIVED, "0")
+    @redis.set(EVENTS_COUNTERS_DISPATCHED, "0")
     @redis.set(EVENTS_COUNTERS_PROCESSED, "0")
     @dispatcher = Dispatcher.new(@redis)
   end
