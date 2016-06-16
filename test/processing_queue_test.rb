@@ -593,6 +593,20 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(50, @redis.llen("queues:1:events"))
   end
 
+  test "should reenqueue operator immediatelly if events exist after batch" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    (1..101).each do |i|
+      @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    end
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal(1, @redis.llen("queues:1:events"))
+    assert_equal(["1"], @redis.lrange("queues:waiting", 0, -1))
+  end
+
   test "should be able to break from processing" do
     worker = @processor.worker
 

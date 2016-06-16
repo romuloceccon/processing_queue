@@ -18,8 +18,10 @@ end
 EOS
 
   LUA_CLEAN_AND_UNLOCK = <<EOS.freeze
-if redis.call('EXISTS', KEYS[3]) == 0 then
+if redis.call('EXISTS', KEYS[4]) == 0 then
   redis.call('SREM', KEYS[2], ARGV[2])
+else
+  redis.call('LPUSH', KEYS[3], ARGV[2])
 end
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
@@ -188,8 +190,8 @@ EOS
         end
 
         # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
-        @redis.evalsha(@clean_script, [lock, KNOWN_QUEUES_SET, queue],
-          [@lock_id, queue_id])
+        @redis.evalsha(@clean_script, [lock, KNOWN_QUEUES_SET,
+          WAITING_QUEUES_LIST, queue], [@lock_id, queue_id])
       ensure
         @trap_handler = @handler_exit
       end
