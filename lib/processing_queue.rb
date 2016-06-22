@@ -72,74 +72,75 @@ EOS
     end
 
     private
-      def prepare_events(list)
-        cnt = @redis.llen(list)
 
-        (1..cnt).map do |i|
-          json = @redis.lindex(list, -i)
-          data = JSON.parse(json)
-          queue_id, object = yield(data)
-          [queue_id, object, data]
+    def prepare_events(list)
+      cnt = @redis.llen(list)
+
+      (1..cnt).map do |i|
+        json = @redis.lindex(list, -i)
+        data = JSON.parse(json)
+        queue_id, object = yield(data)
+        [queue_id, object, data]
+      end
+    end
+
+    def enqueue_events(events)
+      result = []
+
+      events.each do |(queue_id, object, data)|
+        id_str = queue_id.to_s
+
+        # Keep a set of known queues. On restart/cleanup we need to scan for
+        # queues abandoned/locked by crashed workers (see below).
+        @redis.sadd(KNOWN_QUEUES_SET, id_str)
+        unless result.include?(id_str)
+          @redis.lpush(WAITING_QUEUES_LIST, id_str)
+          result << id_str
+        end
+
+        hsh = {}
+        hsh['data'] = data
+        hsh['object'] = object if object
+        @redis.lpush(ProcessingQueue.queue_events_list(id_str), hsh.to_json)
+        @redis.incr(EVENTS_COUNTERS_DISPATCHED)
+      end
+
+      result
+    end
+
+    def find_abandoned_queues
+      known, processing = @redis.multi do
+        @redis.smembers(KNOWN_QUEUES_SET)
+        @redis.lrange(PROCESSING_QUEUES_LIST, 0, -1)
+      end
+
+      keep_list = []
+      abandoned = []
+
+      processing.reverse.each do |x|
+        keep_list << (locked = @redis.exists(ProcessingQueue.queue_lock(x)))
+        abandoned << x if known.include?(x) && !locked
+      end
+      [keep_list, abandoned.uniq]
+    end
+
+    def enqueue_abandoned_queues(abandoned_queues, ignore_list)
+      keep_list, abandoned = abandoned_queues
+
+      abandoned.each do |op_str|
+        unless ignore_list.include?(op_str)
+          @redis.lpush(WAITING_QUEUES_LIST, op_str)
         end
       end
 
-      def enqueue_events(events)
-        result = []
-
-        events.each do |(queue_id, object, data)|
-          id_str = queue_id.to_s
-
-          # Keep a set of known queues. On restart/cleanup we need to scan for
-          # queues abandoned/locked by crashed workers (see below).
-          @redis.sadd(KNOWN_QUEUES_SET, id_str)
-          unless result.include?(id_str)
-            @redis.lpush(WAITING_QUEUES_LIST, id_str)
-            result << id_str
-          end
-
-          hsh = {}
-          hsh['data'] = data
-          hsh['object'] = object if object
-          @redis.lpush(ProcessingQueue.queue_events_list(id_str), hsh.to_json)
-          @redis.incr(EVENTS_COUNTERS_DISPATCHED)
-        end
-
-        result
-      end
-
-      def find_abandoned_queues
-        known, processing = @redis.multi do
-          @redis.smembers(KNOWN_QUEUES_SET)
-          @redis.lrange(PROCESSING_QUEUES_LIST, 0, -1)
-        end
-
-        keep_list = []
-        abandoned = []
-
-        processing.reverse.each do |x|
-          keep_list << (locked = @redis.exists(ProcessingQueue.queue_lock(x)))
-          abandoned << x if known.include?(x) && !locked
-        end
-        [keep_list, abandoned.uniq]
-      end
-
-      def enqueue_abandoned_queues(abandoned_queues, ignore_list)
-        keep_list, abandoned = abandoned_queues
-
-        abandoned.each do |op_str|
-          unless ignore_list.include?(op_str)
-            @redis.lpush(WAITING_QUEUES_LIST, op_str)
-          end
-        end
-
-        keep_list.each do |keep|
-          if keep
-            @redis.rpoplpush(PROCESSING_QUEUES_LIST, PROCESSING_QUEUES_LIST)
-          else
-            @redis.rpop(PROCESSING_QUEUES_LIST)
-          end
+      keep_list.each do |keep|
+        if keep
+          @redis.rpoplpush(PROCESSING_QUEUES_LIST, PROCESSING_QUEUES_LIST)
+        else
+          @redis.rpop(PROCESSING_QUEUES_LIST)
         end
       end
+    end
   end
 
   class Worker
@@ -208,9 +209,10 @@ EOS
     end
 
     private
-      def terminate
-        exit(@interrupted)
-      end
+
+    def terminate
+      exit(@interrupted)
+    end
   end
 
   class Performance
@@ -233,14 +235,15 @@ EOS
     end
 
     private
-      def get_time
-        Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      end
 
-      def update_counter(counter, val)
-        return if val <= 0
-        @redis.evalsha(@script, [counter], [val, PERF_COUNTER_HISTORY])
-      end
+    def get_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def update_counter(counter, val)
+      return if val <= 0
+      @redis.evalsha(@script, [counter], [val, PERF_COUNTER_HISTORY])
+    end
   end
 
   class Statistics
@@ -290,10 +293,11 @@ EOS
       end
 
       private
-        def sum_recent_counters(arr, secs)
-          arr.slice(0, secs / PERF_COUNTER_RESOLUTION).
-            inject(0) { |acc, x| acc + x }
-        end
+
+      def sum_recent_counters(arr, secs)
+        arr.slice(0, secs / PERF_COUNTER_RESOLUTION).
+          inject(0) { |acc, x| acc + x }
+      end
     end
 
     attr_reader :received_count, :dispatched_count, :processed_count
