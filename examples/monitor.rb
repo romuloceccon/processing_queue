@@ -121,6 +121,8 @@ class Performance
 end
 
 class Operators
+  COL_WIDTHS = [8, 8, 8, 8, 8, 8].freeze
+
   def initialize(stats, top)
     @top = top
     @stats = stats
@@ -141,9 +143,15 @@ class Operators
 
     @window.attron(Curses::A_BOLD)
     @window.attron(Curses::A_REVERSE)
-    header = 'NAME        SIZE   WORKER      TTL  QUEUED?  TAKEN?'
-    @window.addstr(header)
-    @window.addstr(' ' * (@cols - header.size)) if header.size < @cols
+
+    @window.addstr(' ' * @cols)
+    add_col(0, 0, 'NAME')
+    add_col(0, 1, 'SIZE', true)
+    add_col(0, 2, 'WORKER', true)
+    add_col(0, 3, 'TTL', true)
+    add_col(0, 4, 'QUEUED?')
+    add_col(0, 5, 'TAKEN?')
+
     @window.attroff(Curses::A_BOLD)
     @window.attroff(Curses::A_REVERSE)
 
@@ -151,29 +159,16 @@ class Operators
       y = i + 1
       break if y >= @window.maxy
 
-      @window.setpos(y, 0)
-      @window.addstr(queue.name)
-
-      @window.setpos(y, 9)
-      @window.addstr("%7d" % [queue.count])
+      add_col(y, 0, queue.name)
+      add_col(y, 1, ' ' + queue.count.to_s, true)
 
       if queue.locked?
-        @window.setpos(y, 18)
-        @window.addstr("%7s" % [queue.locked_by])
-
-        @window.setpos(y, 27)
-        @window.addstr("%7d" % [queue.ttl])
+        add_col(y, 2, queue.locked_by, true)
+        add_col(y, 3, queue.ttl, true)
       end
 
-      if queue.queued?
-        @window.setpos(y, 36 + 3)
-        @window.addstr("X")
-      end
-
-      if queue.taken?
-        @window.setpos(y, 45 + 3)
-        @window.addstr("X")
-      end
+      add_col(y, 4, "   X") if queue.queued?
+      add_col(y, 5, "   X") if queue.taken?
     end
 
     @window.noutrefresh
@@ -185,6 +180,19 @@ class Operators
 
   def close
     @window.close
+  end
+
+  private
+
+  def add_col(y, num, text, align_right=false)
+    text = text.to_s
+    offset = align_right ? COL_WIDTHS[num] - text.size - 1 : 0
+    @window.setpos(y, get_pos(num) + offset)
+    @window.addstr(text)
+  end
+
+  def get_pos(col)
+    COL_WIDTHS[0...col].inject(col) { |sum, x| sum + x }
   end
 end
 
