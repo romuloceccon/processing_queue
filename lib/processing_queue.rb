@@ -166,7 +166,9 @@ EOS
 
       @trap_handler = @handler_flag
       begin
-        return unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
+        unless @redis.set(lock, @lock_id, nx: true, px: LOCK_TIMEOUT)
+          return false
+        end
 
         performance = Performance.new(@redis, @inc_counter_script)
 
@@ -192,6 +194,7 @@ EOS
         # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
         @redis.evalsha(@clean_script, [lock, KNOWN_QUEUES_SET,
           WAITING_QUEUES_LIST, queue], [@lock_id, queue_id])
+        true
       ensure
         @trap_handler = @handler_exit
       end

@@ -430,13 +430,14 @@ class ProcessingQueueTest < Test::Unit::TestCase
     @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
 
     cnt = 0
-    worker.process("1") do |events|
+    process_result = worker.process("1") do |events|
       events.each do |event|
         cnt += 1
         assert_equal({ 'val' => cnt }, event)
       end
     end
 
+    assert_equal(true, process_result)
     assert_equal(2, cnt)
     assert_equal([], @redis.smembers("queues:known"))
     assert_equal(0, @redis.llen("queues:1:events"))
@@ -502,8 +503,9 @@ class ProcessingQueueTest < Test::Unit::TestCase
     @redis.set("queues:1:lock", "1234")
 
     cnt = 0
-    worker.process("1") { |events| events.each { cnt += 1 } }
+    process_result = worker.process("1") { |events| events.each { cnt += 1 } }
 
+    assert_equal(false, process_result)
     assert_equal(0, cnt)
     assert_equal(1, @redis.llen("queues:1:events"))
   end
