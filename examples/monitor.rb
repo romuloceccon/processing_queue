@@ -121,7 +121,7 @@ class Performance
 end
 
 class Operators
-  COL_WIDTHS = [8, 8, 8, 8, 8, 8].freeze
+  COL_WIDTHS = [16, 8, 8, 8, 8, 8].freeze
 
   def initialize(stats, top)
     @top = top
@@ -160,7 +160,7 @@ class Operators
       break if y >= @window.maxy
 
       add_col(y, 0, queue.name)
-      add_col(y, 1, ' ' + queue.count.to_s, true)
+      add_col(y, 1, queue.count, true)
 
       if queue.locked?
         add_col(y, 2, queue.locked_by, true)
