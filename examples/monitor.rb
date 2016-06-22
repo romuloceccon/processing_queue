@@ -227,7 +227,7 @@ begin
 
   stats = ProcessingQueue::Statistics.new(Redis.new)
 
-  header = Header.new('VMpay queue monitor', 0)
+  header = Header.new('Queue Monitor', 0)
   events = Events.new(stats, 3)
   performance = Performance.new(stats, 4)
   operators = Operators.new(stats, 7)
