@@ -8,6 +8,7 @@ Gem::Specification.new do |s|
   s.email       = 'romuloceccon@gmail.com'
   s.homepage    = 'http://www.vertitecnologia.com.br/'
   s.files       = ['lib/processing_queue.rb']
+  s.executables = ['queue-monitor']
   s.license     = 'Nonstandard'
 
   s.add_runtime_dependency 'curses', ['~> 1.0']

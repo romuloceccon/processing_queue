@@ -1,3 +1,5 @@
+#! /usr/bin/env ruby
+
 require 'curses'
 require 'redis'
 require 'processing_queue'
