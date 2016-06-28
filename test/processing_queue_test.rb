@@ -31,6 +31,11 @@ class ProcessingQueueTest < Test::Unit::TestCase
       @after_hooks[symbol] = block
     end
 
+    def clear
+      @before_hooks.clear
+      @after_hooks.clear
+    end
+
     def call_hook(hook_list, symbol, *args)
       hook_list[symbol].call(*args) if hook_list.key?(symbol)
     end
@@ -410,6 +415,53 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(["40", "20"], @redis.lrange("queues:processing", 0, -1))
   end
 
+  test "should not enqueue suspended operator" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("queues:suspended", "30")
+
+    @redis.lpush("events:queue", { "id" => 1 }.to_json)
+    dispatcher.dispatch_all { [30, 300] }
+
+    assert_equal(1, @redis.llen("queues:30:events"))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should not reenqueue abandoned and suspended operator" do
+    dispatcher = @processor.dispatcher
+
+    @redis.sadd("queues:suspended", "30")
+    @redis.lpush("queues:processing", "30")
+
+    @redis.lpush("events:queue", { "id" => 1 }.to_json)
+    dispatcher.dispatch_all { [30, 300] }
+
+    assert_equal(1, @redis.llen("queues:30:events"))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should not enqueue operator suspended during dispatching" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
+
+    @redis.sadd("queues:suspended", "30")
+
+    @redis.lpush("events:queue", { "id" => 1 }.to_json)
+    @redis.lpush("events:queue", { "id" => 2 }.to_json)
+
+    redis_aux = Redis.new(db: 15)
+    wrapper.before(:sadd) do |*args|
+      redis_aux.sadd("queues:suspended", "60")
+      wrapper.clear
+    end
+
+    dispatcher.dispatch_all { |ev| [ev['id'] * 30, ev['id'] * 300] }
+
+    assert_equal(1, @redis.llen("queues:30:events"))
+    assert_equal(1, @redis.llen("queues:60:events"))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
   # ----- worker unit tests -----
 
   test "should get operator from queue" do
@@ -609,6 +661,21 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(["1"], @redis.lrange("queues:waiting", 0, -1))
   end
 
+  test "should not reenqueue operator if queue is found to be suspended after batch" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.sadd("queues:suspended", "1")
+    (1..101).each do |i|
+      @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    end
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal(1, @redis.llen("queues:1:events"))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
   test "should be able to break from processing" do
     worker = @processor.worker
 
@@ -621,6 +688,49 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
     assert_equal(["1"], @redis.smembers("queues:known"))
     assert_equal(2, @redis.llen("queues:1:events"))
+  end
+
+  # ----- general processing queue tests -----
+
+  test "should add queue to suspended list" do
+    @redis.lpush("queues:waiting", "1")
+    @redis.lpush("queues:waiting", "2")
+    @redis.lpush("queues:waiting", "1")
+
+    @processor.suspend_queue("1")
+
+    assert_equal(["1"], @redis.smembers("queues:suspended"))
+    assert_equal(["2"], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should resume queue without events" do
+    @redis.sadd("queues:suspended", "1")
+
+    @processor.resume_queue("1")
+
+    assert_equal([], @redis.smembers("queues:suspended"))
+    assert_equal([], @redis.smembers("queues:known"))
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should resume queue with events" do
+    @redis.sadd("queues:suspended", "1")
+    @redis.lpush("queues:1:events", "a")
+
+    @processor.resume_queue("1")
+
+    assert_equal([], @redis.smembers("queues:suspended"))
+    assert_equal(["1"], @redis.smembers("queues:known"))
+    assert_equal(["1"], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should not resume unsuspended queue" do
+    @redis.lpush("queues:1:events", "a")
+    @redis.lpush("queues:waiting", "1")
+
+    @processor.resume_queue("1")
+
+    assert_equal(["1"], @redis.lrange("queues:waiting", 0, -1))
   end
 
   # ----- statistics unit tests -----
@@ -667,6 +777,15 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_false(operator.locked?)
     assert_true(operator.queued?)
     assert_false(operator.taken?)
+  end
+
+  test "should get suspended operator status" do
+    @redis.sadd("queues:suspended", '1')
+    @statistics = ProcessingQueue::Statistics.new(@redis)
+
+    assert_equal(1, @statistics.queues.count)
+    operator = @statistics.queues.first
+    assert_true(operator.suspended?)
   end
 
   test "should get processing operator status" do
@@ -742,6 +861,18 @@ class ProcessingQueueTest < Test::Unit::TestCase
     @redis.sadd("queues:known", 'a')
     @redis.lpush("queues:a:events", 'a')
     @redis.set("queues:10:lock", '123/123')
+    @statistics = ProcessingQueue::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.queues.count)
+    assert_equal(['10', 'a', '+11'], @statistics.queues.map(&:name))
+  end
+
+  test "should sort operators by suspend state" do
+    @redis.sadd("queues:known", '+11')
+    @redis.sadd("queues:known", '10')
+    @redis.sadd("queues:known", 'a')
+    @redis.set("queues:a:lock", '123/123')
+    @redis.sadd("queues:suspended", '10')
     @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queues.count)

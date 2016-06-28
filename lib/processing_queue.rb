@@ -17,14 +17,60 @@ while true do
 end
 EOS
 
+  # @!method LUA_CLEAN_AND_UNLOCK([lock, known_queues, suspended_queues,
+  #                              waiting_queues, events_list], [lock_id, queue])
+  #
+  # Cleanup queue lists and release previously acquired lock.
+  #
+  # `events_list` will be checked for existing events. If there aren't any then
+  # `queue` will be removed from the `known_queues` set. Otherwise `queue`
+  # will be pushed back to the `waiting_queues` list, unless it appears in the
+  # `suspended_queues` set.
+  #
+  # `lock` and `lock_id` are used to release the lock according to
+  # {http://redis.io/topics/distlock#the-redlock-algorithm The Redlock Algorithm}.
+  #
+  # @param [String] lock Queue lock name
+  # @param [String] known_queues Set with the known queues
+  # @param [String] suspended_queues Set with the suspended queues
+  # @param [String] waiting_queues List with the waiting queues
+  # @param [String] events_list List with the queue events
+  # @param [String] lock_id Queue lock unique id
+  # @param [String] queue Queue name
   LUA_CLEAN_AND_UNLOCK = <<EOS.freeze
-if redis.call('EXISTS', KEYS[4]) == 0 then
+if redis.call('EXISTS', KEYS[5]) == 0 then
   redis.call('SREM', KEYS[2], ARGV[2])
-else
-  redis.call('LPUSH', KEYS[3], ARGV[2])
+elseif redis.call('SISMEMBER', KEYS[3], ARGV[2]) == 0 then
+  redis.call('LPUSH', KEYS[4], ARGV[2])
 end
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
+end
+return 0
+EOS
+
+  # @!method LUA_RESUME_QUEUE([known_queues, suspended_queues, waiting_queues,
+  #                            events_list], [queue])
+  #
+  # Resumes execution of a suspended `queue`.
+  #
+  # If there are any events on the `events_list` the queue is added to the
+  # `waiting_queues` list and the `known_queues` set. If `queue` is found not to
+  # be suspended nothing happens.
+  #
+  # @param [String] known_queues Set with the known queues
+  # @param [String] suspended_queues Set with the suspended queues
+  # @param [String] waiting_queues List with the waiting queues
+  # @param [String] events_list List with the queue events
+  # @param [String] queue Queue name
+  LUA_RESUME_QUEUE = <<EOS.freeze
+local queue = ARGV[1]
+if redis.call('SISMEMBER', KEYS[2], queue) == 1 then
+  if redis.call('EXISTS', KEYS[4]) == 1 then
+    redis.call('LPUSH', KEYS[3], queue)
+    redis.call('SADD', KEYS[1], queue)
+  end
+  redis.call('SREM', KEYS[2], queue)
 end
 return 0
 EOS
@@ -44,6 +90,7 @@ EOS
   WAITING_QUEUES_LIST = "queues:waiting".freeze
   PROCESSING_QUEUES_LIST = "queues:processing".freeze
   KNOWN_QUEUES_SET = "queues:known".freeze
+  SUSPENDED_QUEUES_SET = "queues:suspended".freeze
 
   class Dispatcher
     def initialize(redis)
@@ -63,11 +110,17 @@ EOS
 
       abandoned_queues = find_abandoned_queues
 
-      # Enqueue events and delete temporary queue atomically
-      @redis.multi do
-        seen_queues = enqueue_events(list)
-        enqueue_abandoned_queues(abandoned_queues, seen_queues)
-        @redis.del(DISPATCHING_EVENTS_LIST)
+      # Retry until multi succeeds
+      loop do
+        @redis.watch(SUSPENDED_QUEUES_SET)
+        suspended = @redis.smembers(SUSPENDED_QUEUES_SET)
+
+        # Enqueue events and delete temporary queue atomically
+        break if @redis.multi do
+          seen_queues = enqueue_events(list, suspended) + suspended
+          enqueue_abandoned_queues(abandoned_queues, seen_queues)
+          @redis.del(DISPATCHING_EVENTS_LIST)
+        end
       end
     end
 
@@ -84,7 +137,7 @@ EOS
       end
     end
 
-    def enqueue_events(events)
+    def enqueue_events(events, suspended_queues)
       result = []
 
       events.each do |(queue_id, object, data)|
@@ -93,7 +146,7 @@ EOS
         # Keep a set of known queues. On restart/cleanup we need to scan for
         # queues abandoned/locked by crashed workers (see below).
         @redis.sadd(KNOWN_QUEUES_SET, id_str)
-        unless result.include?(id_str)
+        unless result.include?(id_str) || suspended_queues.include?(id_str)
           @redis.lpush(WAITING_QUEUES_LIST, id_str)
           result << id_str
         end
@@ -192,9 +245,10 @@ EOS
           end
         end
 
-        # Ver [The Redlock Algorithm](http://redis.io/commands/setnx).
-        @redis.evalsha(@clean_script, [lock, KNOWN_QUEUES_SET,
-          WAITING_QUEUES_LIST, queue], [@lock_id, queue_id])
+        @redis.evalsha(
+          @clean_script,
+          [lock, KNOWN_QUEUES_SET, SUSPENDED_QUEUES_SET, WAITING_QUEUES_LIST, queue],
+          [@lock_id, queue_id])
         true
       ensure
         @trap_handler = @handler_exit
@@ -250,9 +304,11 @@ EOS
     class Queue
       attr_reader :name, :count, :locked_by, :ttl
 
-      def initialize(redis, queue_id, waiting_queues, processing_queues)
+      def initialize(redis, queue_id, suspended_queues, waiting_queues,
+          processing_queues)
         @name = queue_id
         @count = redis.llen(ProcessingQueue.queue_events_list(queue_id))
+        @suspended = suspended_queues.include?(queue_id)
         @queued = waiting_queues.include?(queue_id)
         @processing = processing_queues.include?(queue_id)
         @locked_by = @ttl = nil
@@ -272,12 +328,17 @@ EOS
         @queued
       end
 
+      def suspended?
+        @suspended
+      end
+
       def taken?
         @processing
       end
 
       def <=>(other)
-        return locked? ? -1 : 1 if locked? ^ other.locked?
+        return suspended? ? -1 : 1 if suspended? != other.suspended?
+        return locked? ? -1 : 1 if locked? != other.locked?
         return other.count <=> count if count != other.count
         return name <=> other.name
       end
@@ -311,12 +372,13 @@ EOS
     end
 
     def update
-      disp_cnt, proc_cnt, q_len, q_known, q_waiting, q_proc = @redis.multi do
+      disp_cnt, proc_cnt, q_len, q_known, q_susp, q_waiting, q_proc = @redis.multi do
         @redis.get(EVENTS_COUNTERS_DISPATCHED)
         @redis.get(EVENTS_COUNTERS_PROCESSED)
         @redis.llen(INITIAL_QUEUE)
 
         @redis.smembers(KNOWN_QUEUES_SET)
+        @redis.smembers(SUSPENDED_QUEUES_SET)
         @redis.lrange(WAITING_QUEUES_LIST, 0, -1)
         @redis.lrange(PROCESSING_QUEUES_LIST, 0, -1)
       end
@@ -326,9 +388,9 @@ EOS
 
       @received_count = @dispatched_count + @queue_length
 
-      q_all = (q_known + q_waiting + q_proc).uniq
+      q_all = (q_known + q_susp + q_waiting + q_proc).uniq
       @queues = q_all.map do |q_id|
-        Queue.new(@redis, q_id, q_waiting, q_proc)
+        Queue.new(@redis, q_id, q_susp, q_waiting, q_proc)
       end
       @queues.sort!
 
@@ -371,6 +433,18 @@ EOS
     @redis.set(EVENTS_COUNTERS_DISPATCHED, "0")
     @redis.set(EVENTS_COUNTERS_PROCESSED, "0")
     @dispatcher = Dispatcher.new(@redis)
+  end
+
+  def resume_queue(queue)
+    @redis.eval(LUA_RESUME_QUEUE, [KNOWN_QUEUES_SET, SUSPENDED_QUEUES_SET,
+      WAITING_QUEUES_LIST, ProcessingQueue.queue_events_list(queue)], [queue])
+  end
+
+  def suspend_queue(queue)
+    @redis.multi do
+      @redis.sadd(SUSPENDED_QUEUES_SET, queue)
+      @redis.lrem(WAITING_QUEUES_LIST, 0, queue)
+    end
   end
 
   def worker
