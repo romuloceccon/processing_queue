@@ -4,7 +4,7 @@ require 'securerandom'
 
 class ProcessingQueue
   LOCK_TIMEOUT = 300_000
-  MAX_BATCH_SIZE = 100
+  DEFAULT_BATCH_SIZE = 100
 
   PERF_COUNTER_RESOLUTION = 5  # 5 seconds
   PERF_COUNTER_HISTORY = 900   # 15 minutes
@@ -197,9 +197,10 @@ EOS
   end
 
   class Worker
-    def initialize(redis)
+    def initialize(redis, options)
       @redis = redis
       @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
+      @max_batch_size = options[:max_batch_size] || DEFAULT_BATCH_SIZE
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
       @inc_counter_script = @redis.script('LOAD', LUA_INC_PERF_COUNTER)
       @interrupted = nil
@@ -228,7 +229,7 @@ EOS
 
         cnt = 0
         enum = Enumerator.new do |y|
-          while !@interrupted && cnt < MAX_BATCH_SIZE &&
+          while !@interrupted && cnt < @max_batch_size &&
               event = @redis.lindex(queue, -(cnt + 1)) do
             cnt += 1
             performance.store(1)
@@ -445,8 +446,8 @@ EOS
     end
   end
 
-  def worker
-    return Worker.new(@redis)
+  def worker(options={})
+    return Worker.new(@redis, options)
   end
 
   def self.queue_events_list(id)

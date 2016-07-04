@@ -647,6 +647,18 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(50, @redis.llen("queues:1:events"))
   end
 
+  test "should allow custom worker batch size" do
+    worker = @processor.worker(:max_batch_size => 2)
+
+    (1..3).each { |i| @redis.lpush("queues:1:events", { 'val' => 1 }.to_json) }
+
+    cnt = 0
+    worker.process("1") { |events| events.each { cnt += 1 } }
+
+    assert_equal(2, cnt)
+    assert_equal(1, @redis.llen("queues:1:events"))
+  end
+
   test "should reenqueue operator immediatelly if events exist after batch" do
     worker = @processor.worker
 
