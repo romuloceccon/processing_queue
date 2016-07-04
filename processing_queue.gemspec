@@ -7,7 +7,7 @@ Gem::Specification.new do |s|
   s.authors     = ['Rômulo A. Ceccon']
   s.email       = 'romuloceccon@gmail.com'
   s.homepage    = 'http://www.vertitecnologia.com.br/'
-  s.files       = ['lib/processing_queue.rb']
+  s.files       = ['lib/processing_queue.rb', 'lib/processing_queue/monitor.rb']
   s.executables = ['queue-monitor']
   s.license     = 'Nonstandard'
 
