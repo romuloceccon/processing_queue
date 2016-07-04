@@ -95,14 +95,14 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_not_nil(@processor.dispatcher)
   end
 
-  test "should initialize event counters" do
-    @redis.set("events:counters:dispatched", "1")
-    @redis.set("events:counters:processed", "1")
+  test "should not reset event counters" do
+    @redis.set("events:counters:dispatched", "123")
+    @redis.set("events:counters:processed", "456")
 
     @processor.dispatcher
 
-    assert_equal("0", @redis.get("events:counters:dispatched"))
-    assert_equal("0", @redis.get("events:counters:processed"))
+    assert_equal("123", @redis.get("events:counters:dispatched"))
+    assert_equal("456", @redis.get("events:counters:processed"))
   end
 
   test "should append dispatching events to queue on dispatcher creation" do

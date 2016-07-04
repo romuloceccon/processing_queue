@@ -430,8 +430,6 @@ EOS
     return @dispatcher if @dispatcher
 
     @redis.evalsha(@join_script, [DISPATCHING_EVENTS_LIST, INITIAL_QUEUE])
-    @redis.set(EVENTS_COUNTERS_DISPATCHED, "0")
-    @redis.set(EVENTS_COUNTERS_PROCESSED, "0")
     @dispatcher = Dispatcher.new(@redis)
   end
 
