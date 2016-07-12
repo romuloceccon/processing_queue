@@ -2,6 +2,109 @@ require 'redis'
 require 'json'
 require 'securerandom'
 
+# Queue to process events sequentially among multiple workers.
+#
+# {ProcessingQueue} takes a Redis list with events, classifies each one of them
+# into individual queues, and delegates the processing of those events to
+# workers, in such a way that an individual queue can be processed by at most
+# one worker at any given time.
+#
+# ## How it works
+#
+# A single {ProcessingQueue::Dispatcher} is responsible for classifying the
+# events into individual queues. It takes an {ProcessingQueue.INITIAL_QUEUE},
+# _pre-processes_ each event through the rules given to
+# {ProcessingQueue::Dispatcher#dispatch_all}, and places the event in the
+# appropriate {ProcessingQueue.queue_events_list}, using the information
+# returned by the _pre-processing_. The id of each destination queue will then
+# be placed in a {ProcessingQueue.WAITING_QUEUES_LIST} to signal the workers
+# that those queue have events available for _processing_.
+#
+# Multiple {ProcessingQueue::Worker}'s will wait on
+# {ProcessingQueue.WAITING_QUEUES_LIST}. Once an item is ready to be processed
+# the worker first tries to setup a {ProcessingQueue.queue_lock}. If it fails,
+# because the queue is already locked, it waits again for the next one.
+# Otherwise, if the lock is successfully granted, it starts processing the
+# events, yielding than sequentially to the block given to
+# {ProcessingQueue::Worker#process}. Upon completion the lock is released, the
+# events removed from the queue, and the worker goes back to the waiting list.
+#
+# ## Usage
+#
+# A dispatcher instance is obtained with {ProcessingQueue#dispatcher}. After
+# that it should sit in a loop calling
+# {ProcessingQueue::Dispatcher#dispatch_all}, which yields every event found to
+# the given block. The block should then return a pair where the first item is
+# the name of the queue the event should be dispatched to, and the second item
+# is an optional object which will be attached to the event. The method returns
+# when all events have been dispatched. The script should sleep for some time
+# before the next iteration, until enough events have arrived (that's not
+# mandatory, but only a recommendation to avoid keeping the cpu busy processing
+# a list which is empty most of the time).
+#
+# Example:
+#
+#     processing_queue = ProcessingQueue.new(redis_instance)
+#
+#     dispatcher = processing_queue.dispatcher
+#     loop do
+#       dispatcher.dispatch_all do |event|
+#         queue = find_queue_name(event)
+#         object = find_object(event)
+#         [queue, object]
+#       end
+#
+#       sleep(10)
+#     end
+#
+# The worker is obtained with {ProcessingQueue#worker}. It's recommended to call
+# {ProcessingQueue::Worker#trap!} right after instantiating the object, in order
+# to allow graceful termination of the script when it receives INT or TERM
+# signals.
+#
+# The loop starts by calling {ProcessingQueue::Worker#wait_for_queue}, a method
+# which will block until a queue is signaled to be ready by
+# {ProcessingQueue::Dispatcher}. The name of the queue is returned and that
+# should be passed as the only argument to {ProcessingQueue::Worker#process},
+# which yields an enumerator with a list of events (by default limited to 100
+# items). The enumerator should be used to iterate over the events. The event
+# will be in a slightly different format than what arrives in the dispatcher:
+# a hash where the original event will be found at the `"data"` key, and the
+# second item returned from the dispatch block will be found at the `"object"`
+# key.
+#
+# Note that, unlike the dispatcher, the worker does not yield the event itself,
+# but a list of events. That's required so that the block is able to determine
+# precisely when the list is finished, allowing, for example, the processing of
+# all events in a single database transaction. And it's also important because
+# the events will be removed from the queue _only after the block returns
+# successfully_. If the script crashes after processing half the events _all_ of
+# them will be rescheduled for processing at the next opportunity. On the other
+# hand it's also possible to break (successfully) from processing before
+# iterating through the whole enumerator: in such case only the events iterated
+# through will be removed from the queue.
+#
+# So the correct pattern is to open a transaction, iterate through all the
+# events, and commit the transaction before returning from the block. Example:
+#
+#     processing_queue = ProcessingQueue.new(redis_instance)
+#
+#     worker = @processing_queue.worker
+#     worker.trap!
+#
+#     loop do
+#       queue = worker.wait_for_queue
+#
+#       worker.process(queue) do |events|
+#         transaction do
+#           events.each do |event|
+#             object = event['object']
+#             original = event['data']
+#             process_event(object, original)
+#           end
+#         end
+#       end
+#     end
 class ProcessingQueue
   LOCK_TIMEOUT = 300_000
   DEFAULT_BATCH_SIZE = 100
@@ -9,6 +112,19 @@ class ProcessingQueue
   PERF_COUNTER_RESOLUTION = 5  # 5 seconds
   PERF_COUNTER_HISTORY = 900   # 15 minutes
 
+  # @!method LUA_JOIN_LISTS([dispatching_list, events_list])
+  # @!scope class
+  #
+  # Merge dispatching list into events list.
+  #
+  # All events in `dispatching_list` will be taken in reverse order and pushed
+  # back to `events_list`, such that the events (a) appear in the order they
+  # were initially found before being moved to `dispatching_list` and (b) are
+  # placed _before_ current events in `events_list`.
+  #
+  # @param [String] dispatching_list Name of temporary event list
+  # @param [String] events_list Name of initial event list
+  # @return [nil]
   LUA_JOIN_LISTS = <<EOS.freeze
 while true do
   local val = redis.call('LPOP', KEYS[1])
@@ -17,8 +133,8 @@ while true do
 end
 EOS
 
-  # @!method LUA_CLEAN_AND_UNLOCK([lock, known_queues, suspended_queues,
-  #                              waiting_queues, events_list], [lock_id, queue])
+  # @!method LUA_CLEAN_AND_UNLOCK([lock, known_queues, suspended_queues, waiting_queues, events_list], [lock_id, queue])
+  # @!scope class
   #
   # Cleanup queue lists and release previously acquired lock.
   #
@@ -29,6 +145,8 @@ EOS
   #
   # `lock` and `lock_id` are used to release the lock according to
   # {http://redis.io/topics/distlock#the-redlock-algorithm The Redlock Algorithm}.
+  # If the client executing the script does not own `lock` the cleanup will
+  # still happen, but `lock` won't be released.
   #
   # @param [String] lock Queue lock name
   # @param [String] known_queues Set with the known queues
@@ -37,6 +155,7 @@ EOS
   # @param [String] events_list List with the queue events
   # @param [String] lock_id Queue lock unique id
   # @param [String] queue Queue name
+  # @return [Integer] 1 if the lock was successfully released; 0 otherwise
   LUA_CLEAN_AND_UNLOCK = <<EOS.freeze
 if redis.call('EXISTS', KEYS[5]) == 0 then
   redis.call('SREM', KEYS[2], ARGV[2])
@@ -49,8 +168,8 @@ end
 return 0
 EOS
 
-  # @!method LUA_RESUME_QUEUE([known_queues, suspended_queues, waiting_queues,
-  #                            events_list], [queue])
+  # @!method LUA_RESUME_QUEUE([known_queues, suspended_queues, waiting_queues, events_list], [queue])
+  # @!scope class
   #
   # Resumes execution of a suspended `queue`.
   #
@@ -63,6 +182,7 @@ EOS
   # @param [String] waiting_queues List with the waiting queues
   # @param [String] events_list List with the queue events
   # @param [String] queue Queue name
+  # @return [Integer] Always 0 (zero)
   LUA_RESUME_QUEUE = <<EOS.freeze
 local queue = ARGV[1]
 if redis.call('SISMEMBER', KEYS[2], queue) == 1 then
