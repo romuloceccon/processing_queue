@@ -195,6 +195,19 @@ end
 return 0
 EOS
 
+  # @!method LUA_INC_PERF_COUNTER([perf_counter], [count, ttl])
+  # @!scope class
+  #
+  # Increments performance counter setting a TTL.
+  #
+  # The performance counter `perf_counter` is incremented by `count` using
+  # Redis's `INCRBYFLOAT`. If the key does not exist before the call it's set to
+  # expire after `ttl` seconds.
+  #
+  # @param [String] perf_counter Performance counter key name
+  # @param [Float] count Amount by which to increment the performance counter
+  # @param [Integer] ttl Time-to-live in seconds
+  # @return [nil]
   LUA_INC_PERF_COUNTER = <<EOS.freeze
 local exists = redis.call("EXISTS", KEYS[1]) == 1
 redis.call("INCRBYFLOAT", KEYS[1], ARGV[1])
@@ -212,11 +225,105 @@ EOS
   KNOWN_QUEUES_SET = "queues:known".freeze
   SUSPENDED_QUEUES_SET = "queues:suspended".freeze
 
+  # Pre-processor for classifying events and cleaning up abandoned queues.
+  #
+  # A single instance of {Dispatcher} should be used to classify events arriving
+  # at {ProcessingQueue.INITIAL_QUEUE} and place them at the appropriate
+  # {ProcessingQueue.queue_events_list}.
+  #
+  # It has a safety mechanism in case of a sudden crash: before starting the
+  # actual dispatch the list being pre-processed is moved to a temporary one.
+  # If no error occurs the temporary list is then removed; otherwise, upon
+  # restart, the dispatcher checks for an existing temporary list and merges it
+  # into the {ProcessingQueue.INITIAL_QUEUE} before starting the actual dispatch
+  # loop.
+  #
+  # Another important feature is the clean-up of abandoned worker queues. If a
+  # worker crashes it's going to leave o Redis lock behind, preventing other
+  # workers to work on the same queue. At every iteration the dispatcher will
+  # check for expired locks and reschedule the corresponding queue so that
+  # another worker can work on it.
+  #
+  # See {ProcessingQueue} for usage example.
   class Dispatcher
+    # Initializes the dispatcher. Used internally by
+    # {ProcessingQueue#dispatcher}.
+    #
+    # @param [Object] redis Redis instance
     def initialize(redis)
       @redis = redis
     end
 
+    # Dispatch all events once.
+    #
+    # All events will be yielded in sequence to the block given, in whatever
+    # format they arrived first at {ProcessingQueue.INITIAL_QUEUE}. The result
+    # of the block should be a pair where the first item is the name of a queue
+    # where the event should be put in, and the second item is a
+    # (json-serializable) object which will be attached to the event and
+    # restored when the actual processing occurs. Dispatched events belonging to
+    # the same queue are guaranteed to remain in the exact order (relative to
+    # each other) they were when they arrived at
+    # {ProcessingQueue.INITIAL_QUEUE}.
+    #
+    # ## Internals
+    #
+    # Dispatching starts by moving an existing {ProcessingQueue.INITIAL_QUEUE}
+    # to a {ProcessingQueue.DISPATCHING_EVENTS_LIST}. They are then yielded in
+    # sequence to the block given to get their queue names and attached objects.
+    #
+    # {ProcessingQueue.KNOWN_QUEUES_SET} and
+    # {ProcessingQueue.PROCESSING_QUEUES_LIST} will be checked to find out
+    # whether any worker has crashed, leaving a lock behind: if the queue name
+    # appears in _both_ lists and no lock exists (meaning the corresponding lock
+    # key has expired) it's considered to be abandoned.
+    #
+    # Next, an _atomic_ operation starts, i.e. it's not suscetible to any kind
+    # of race condition with the workers:
+    #
+    # * for each event:
+    #   * the queue name is added to the {ProcessingQueue.KNOWN_QUEUES_SET}
+    #   * the queue name is appended to the
+    #     {ProcessingQueue.WAITING_QUEUES_LIST}
+    #   * the event is appended to its {ProcessingQueue.queue_events_list}
+    # * the names of abandoned queues are appended to
+    #   {ProcessingQueue.WAITING_QUEUES_LIST}
+    # * names of empty queues _which are not currently locked_ are removed from
+    #   {ProcessingQueue.PROCESSING_QUEUES_LIST}
+    # * temporary list {ProcessingQueue.DISPATCHING_EVENTS_LIST} is removed
+    #
+    # Note that, because of the nature of Redis "multi" transactions, we cannot
+    # retrieve values after the transaction starts. Therefore, we are limited to
+    # only _send_ commands. That affects how abandonded queues are managed,
+    # because we must avoid the race condition which exists between starting the
+    # check and starting the transaction when events are pushed.
+    #
+    # The dispatcher is the only process which _removes_ items from
+    # {ProcessingQueue.PROCESSING_QUEUES_LIST}, while the workers can only
+    # _append_ them to it. We rely on that to build a "keep_list" of the queue
+    # names, which are simply a series of instructions about what to do with
+    # every queue name: either remove or reappend. At the end of the "multi"
+    # transaction we "apply" such keep_list. If the instruction says "remove"
+    # the item is just popped with `RPOP`. If instead it says "reappend" the
+    # item is popped and pushed again with `RPOPLPUSH`. That way we can just
+    # "blindly" apply the operations without rechecking the contents of
+    # {ProcessingQueue.PROCESSING_QUEUES_LIST}. If an item is appended by the
+    # worker in the middle of the apply operation it won't be affected, except
+    # by the fact that `RPOPLPUSH`'ed items will appear _after_ the newly
+    # appended item.
+    #
+    # The transaction guarantees that events are removed from the
+    # {ProcessingQueue.DISPATCHING_EVENTS_LIST} only after they have been
+    # successfully appended to their respective queues. If the process crashes
+    # during dispatch it's going to leave a non-empty
+    # {ProcessingQueue.DISPATCHING_EVENTS_LIST} behind. Upon restart
+    # {ProcessingQueue#dispatcher} will look for it and merge it back with
+    # {ProcessingQueue.INITIAL_QUEUE}.
+    #
+    # If some queue was suspended by {ProcessingQueue#suspend_queue} everything
+    # will continue to work as before, except such queue name won't ever be
+    # appended to {ProcessingQueue.WAITING_QUEUES_LIST} (thus not becoming
+    # available for any worker).
     def dispatch_all(&block)
       if @redis.exists(INITIAL_QUEUE)
         # Process queue safely: move master queue to a temporary one that won't
