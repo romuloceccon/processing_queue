@@ -423,7 +423,21 @@ EOS
     end
   end
 
+  # Serial event processor.
+  #
+  # One or more {Worker} instances (one per process) should be used to actually
+  # process the events which were previously classified by the {Dispatcher}.
+  #
+  # See {ProcessingQueue} for usage example.
   class Worker
+    # Initializes the {Worker}. Used internally by {ProcessingQueue#worker}.
+    #
+    # It's possible to control the batch size by passing the option
+    # `:max_batch_size` in the second argument. By default it's set to
+    # {ProcessingQueue.DEFAULT_BATCH_SIZE}.
+    #
+    # @param [Object] redis Redis instance
+    # @param [Hash] options Options hash
     def initialize(redis, options)
       @redis = redis
       @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
@@ -437,11 +451,94 @@ EOS
       @trap_handler = @handler_exit
     end
 
+    # Waits for the next queue.
+    #
+    # Block while no queue is available for processing. When a queue becomes
+    # available the queue name is returned and also appended to
+    # {ProcessingQueue.PROCESSING_QUEUES_LIST}. That way, if the worker crashes
+    # just after BRPOPLPUSH executes, the dispatcher will see the list as
+    # abandoned and reschedule it.
+    #
+    # @return [String] queue name
     def wait_for_queue
       terminate if @interrupted
       @redis.brpoplpush(WAITING_QUEUES_LIST, PROCESSING_QUEUES_LIST)
     end
 
+    # Processes events from the given queue.
+    #
+    # The queue name passed as `queue_id`, returned by {#wait_for_queue}, will
+    # be processed through the block given. {#process} yields and enumerator to
+    # the block, and that enumerator should be iterated through to actually get
+    # to the individual events. The event format is:
+    #
+    #     { "object" => <object>, "data" => <data> }
+    #
+    # where `<object>` is the object returned as the second item of the block
+    # given to {Dispatcher#dispatch_all}, and `<data>` is the actual event as it
+    # arrived in {ProcessingQueue.INITIAL_QUEUE} before going through the
+    # dispatcher.
+    #
+    # No more than {ProcessingQueue.DEFAULT_BATCH_SIZE} (or the value given to
+    # the constructor) will be processed in a single call to {#process}. That
+    # feature is important when processing events inside database transactions,
+    # where holding locks for too long could be harmful to the application.
+    #
+    # Running through the enumerator until the end successfully will remove the
+    # events from the queue definitely, and release the worker to work in
+    # another queue (or even the same queue if the batch was limited by the
+    # configured batch size and no other queue was scheduled).
+    #
+    # An exception raised inside the block, even if most (or all) events have
+    # been processed, has the effect of aborting the whole batch. The queue will
+    # leave the lock _unreleased_, and the dispatcher will see it as abandoned
+    # after its TTL expires. That's on purpose, to prevent a problematic batch
+    # from making all workers raise exceptions endlessly in a busy (or short)
+    # loop.
+    #
+    # As a third option it's also possible to interrupt the processing before
+    # the end of the enumerator, by `break`ing from its block. The events
+    # processed so far will then be removed from the queue and the remaining
+    # ones left to be processed to the next available worker. That's useful, for
+    # example, to shutdown the worker gracefully without waiting for longer
+    # transactions to complete (or, in case the transaction is almost finished,
+    # rolling back previously processed events).
+    #
+    # ## Internals
+    #
+    # First the worker tries to set an exclusive {ProcessingQueue.queue_lock} on
+    # the queue. If it fails, because another worker is holding it, {#process}
+    # returns.
+    #
+    # Each event in the batch is then processed through the enumerator. After
+    # that a single Redis "multi" transaction removes exactly the number of
+    # events processed. That's necessary because (a) the dispatcher may append
+    # more events to the queue while {#process} is running, and (b) if an
+    # exception is raised after processing some events, the whole batch should
+    # be kept untouched to be processed again later.
+    #
+    # {#process} finishes cleaning-up the queue and releasing the lock by
+    # calling {ProcessingQueue.LUA_CLEAN_AND_UNLOCK}.
+    #
+    # ### Performance counters
+    #
+    # Measuring performance is not trivial. To allow for fast and easy check of
+    # current and past worker loads the performance counters have a "timeline"
+    # divided into slots. Each slot stores information about the number of
+    # events processed and the total time spent actually processing them (as
+    # opposed to waiting for available queues). The default slot is 5-seconds
+    # wide. So, to calculate the performance during the last minute, one may
+    # just operate on all counters from the last 12 slots.
+    #
+    # The actual measure is done approximately. The time taken to process each
+    # event is taken individually and stored at the current slot. When the
+    # processing of a single event splits across two (or more) slots we assume,
+    # to simplify, that the whole event was processed in the last slot. That's a
+    # reasonable approximation when events take just a fraction of the slot
+    # width to process.
+    #
+    # @param [String] queue_id The queue name
+    # @return [Boolean] `false` if lock could not be acquired; true otherwise
     def process(queue_id)
       queue = ProcessingQueue.queue_events_list(queue_id)
       lock = ProcessingQueue.queue_lock(queue_id)
@@ -483,11 +580,25 @@ EOS
       end
     end
 
+    # Sets up signal traps to allow clean shutdown.
+    #
+    # Calling {#trap!} is important to allow the worker to shutdown gracefully
+    # in case a SIGTERM or SIGINT is delivered to the application. It changes
+    # the owner process behavior in two ways:
+    #
+    # 1. If _outside_ of {#process}, `Kernel.exit` is called immediatelly;
+    # 2. Otherwise, an `@interrupted` flag is set and the whole processing stops
+    #    when the _current_ event finishes processing. The lock is released so
+    #    that another worker processes the remaining events, and `Kernel.exit`
+    #    is called.
+    #
+    # The value passed to exit follows Bash (and other shells) convention, i.e.
+    # the process returns with a status code equal to 128 + <signal number>.
     def trap!
       return if @trapped
       @trapped = true
-      Signal.trap('INT') { @trap_handler.call(130) }
-      Signal.trap('TERM') { @trap_handler.call(143) }
+      Signal.trap('INT') { @trap_handler.call(130) }  # 128 + SIGINT
+      Signal.trap('TERM') { @trap_handler.call(143) } # 128 + SIGTERM
     end
 
     private
@@ -497,6 +608,7 @@ EOS
     end
   end
 
+  # Helper to store performance counters. Used internally by {Worker}.
   class Performance
     def initialize(redis, script)
       @redis = redis
@@ -504,6 +616,12 @@ EOS
       @previous = get_time
     end
 
+    # Add time and count to performance counters.
+    #
+    # Current slot id is determined by dividing the current time (as given by
+    # the monotonic process clock) by the slot width. `count` and the time since
+    # the last call (or object initialization) is then added to the current
+    # slot.
     def store(count)
       t = get_time
       diff, @previous = t - @previous, t
@@ -648,12 +766,22 @@ EOS
     end
   end
 
+  # Initialize the {ProcessingQueue}.
+  #
+  # @param [Object] redis Redis instance which will be passed to the worker and
+  #   dispatcher
   def initialize(redis)
     @redis = redis
     @dispatcher = nil
     @join_script = @redis.script('LOAD', LUA_JOIN_LISTS)
   end
 
+  # Creates a dispatcher.
+  #
+  # Creates an instance of {Dispatcher} using the Redis instance given to the
+  # constructor.
+  #
+  # @return [Dispatcher]
   def dispatcher
     return @dispatcher if @dispatcher
 
@@ -661,11 +789,38 @@ EOS
     @dispatcher = Dispatcher.new(@redis)
   end
 
+  # Resumes execution of a queue suspended by {#suspend_queue}.
   def resume_queue(queue)
     @redis.eval(LUA_RESUME_QUEUE, [KNOWN_QUEUES_SET, SUSPENDED_QUEUES_SET,
       WAITING_QUEUES_LIST, ProcessingQueue.queue_events_list(queue)], [queue])
   end
 
+  # Suspend execution of a queue.
+  #
+  # A queue can be suspended so that no worker ever acquires its lock. It's
+  # useful for debugging purposes, for example, when a problematic queue in a
+  # production system keeps crashing the workers. Note that suspending a queue
+  # does not release any currently held lock. It merely signals the dispatcher
+  # that the queue should never be scheduled again.
+  #
+  # To successfully operate on a suspended queue create an instance of {Worker}
+  # and call {Worker#process} until it succeeds:
+  #
+  #     processing_queue = ProcessingQueue.new(redis_instance)
+  #     processing_queue.suspend_queue('my-queue')
+  #
+  #     worker = @processing_queue.worker
+  #     worker.trap!
+  #
+  #     loop do
+  #       break if worker.process('my-queue') do |events|
+  #         process events ...
+  #       end
+  #
+  #       sleep(1)
+  #     end
+  #
+  #     processing_queue.resume_queue('my-queue')
   def suspend_queue(queue)
     @redis.multi do
       @redis.sadd(SUSPENDED_QUEUES_SET, queue)
@@ -673,14 +828,29 @@ EOS
     end
   end
 
+  # Creates a worker.
+  #
+  # Creates an instance of {Worker}. `options` will be passed to {Worker}'s
+  # constructor.
+  #
+  # @param [Hash] options
+  # @return [Worker]
   def worker(options={})
     return Worker.new(@redis, options)
   end
 
+  # Returns full name of queue with given id.
+  #
+  # @param [String] id Queue id
+  # @return [String]
   def self.queue_events_list(id)
     "queues:#{id}:events"
   end
 
+  # Returns full name of lock with given queue id.
+  #
+  # @param [String] id Queue id
+  # @return [String]
   def self.queue_lock(id)
     "queues:#{id}:lock"
   end
