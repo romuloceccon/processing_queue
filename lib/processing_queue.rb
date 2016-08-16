@@ -571,7 +571,12 @@ EOS
     #
     # First the worker tries to set an exclusive {ProcessingQueue.queue_lock} on
     # the queue. If it fails, because another worker is holding it, {#process}
-    # returns.
+    # returns. Otherwise, other entries for the just acquired queue are removed
+    # from {ProcessingQueue.WAITING_QUEUES_LIST}. That has the effect of
+    # promoting "fairness" among all queues, since the current processing queue
+    # becomes automatically the last in the waiting list in case {#process}
+    # does not consume all of its events (see
+    # {ProcessingQueue::LUA_CLEAN_AND_UNLOCK}).
     #
     # Each event in the batch is then processed through the enumerator. After
     # that a single Redis "multi" transaction removes exactly the number of
@@ -617,6 +622,8 @@ EOS
         end
 
         Timeout.timeout(EXEC_TIMEOUT) do
+          @redis.lrem(WAITING_QUEUES_LIST, 0, queue_id)
+
           performance = Performance.new(@redis, @inc_counter_script)
 
           cnt = 0

@@ -699,6 +699,43 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(1, @redis.llen("queues:1:events"))
   end
 
+  test "should delete current operator's other entries from waiting queues list" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:waiting", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal([], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should not delete other operators' entries from waiting queues list" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:waiting", "2")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal(["2"], @redis.lrange("queues:waiting", 0, -1))
+  end
+
+  test "should not delete locked operators's entries from waiting queues list" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:waiting", "1")
+    @redis.set("queues:1:lock", "1234")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal(["1"], @redis.lrange("queues:waiting", 0, -1))
+  end
+
   test "should reenqueue operator immediatelly if events exist after batch" do
     worker = @processor.worker
 
