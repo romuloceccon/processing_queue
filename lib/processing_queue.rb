@@ -168,6 +168,25 @@ end
 return 0
 EOS
 
+  # @!method LUA_UNLOCK([lock], [lock_id])
+  # @!scope class
+  #
+  # Release previously acquired lock.
+  #
+  # This is the standard implementation of the
+  # {http://redis.io/topics/distlock#the-redlock-algorithm The Redlock Algorithm},
+  # used by the {ProcessingQueue::Dispatcher}.
+  #
+  # @param [String] lock Event lock name
+  # @param [String] lock_id Event lock unique id
+  # @return [Integer] 1 if the lock was successfully released; 0 otherwise
+  LUA_UNLOCK = <<EOS.freeze
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+EOS
+
   # @!method LUA_RESUME_QUEUE([known_queues, suspended_queues, waiting_queues, events_list], [queue])
   # @!scope class
   #
@@ -216,6 +235,7 @@ EOS
 
   INITIAL_QUEUE = "events:queue".freeze
   DISPATCHING_EVENTS_LIST = "events:dispatching".freeze
+  EVENTS_LOCK = "events:lock".freeze
 
   EVENTS_COUNTERS_DISPATCHED = "events:counters:dispatched".freeze
   EVENTS_COUNTERS_PROCESSED = "events:counters:processed".freeze
@@ -252,6 +272,8 @@ EOS
     # @param [Object] redis Redis instance
     def initialize(redis)
       @redis = redis
+      @lock_id = ProcessingQueue.generate_lock_id
+      @unlock_script = @redis.script('LOAD', LUA_UNLOCK)
     end
 
     # Dispatch all events once.
@@ -324,7 +346,14 @@ EOS
     # will continue to work as before, except such queue name won't ever be
     # appended to {ProcessingQueue.WAITING_QUEUES_LIST} (thus not becoming
     # available for any worker).
+    #
+    # The whole operation is further protected with a Redlock (see
+    # {ProcessingQueue::LUA_UNLOCK}).
     def dispatch_all(&block)
+      unless @redis.set(EVENTS_LOCK, @lock_id, nx: true, px: LOCK_TIMEOUT)
+        return false
+      end
+
       if @redis.exists(INITIAL_QUEUE)
         # Process queue safely: move master queue to a temporary one that won't
         # be touched by the workers. If this instance crashes the temporary
@@ -343,6 +372,9 @@ EOS
         enqueue_abandoned_queues(abandoned_queues, seen_queues)
         @redis.del(DISPATCHING_EVENTS_LIST)
       end
+
+      @redis.evalsha(@unlock_script, [EVENTS_LOCK], [@lock_id])
+      true
     end
 
     # Append event directly to its {ProcessingQueue.queue_events_list}.
@@ -466,7 +498,7 @@ EOS
     # @param [Hash] options Options hash
     def initialize(redis, options)
       @redis = redis
-      @lock_id = "#{SecureRandom.uuid}/#{Process.pid}"
+      @lock_id = ProcessingQueue.generate_lock_id
       @max_batch_size = options[:max_batch_size] || DEFAULT_BATCH_SIZE
       @clean_script = @redis.script('LOAD', LUA_CLEAN_AND_UNLOCK)
       @inc_counter_script = @redis.script('LOAD', LUA_INC_PERF_COUNTER)
@@ -863,6 +895,13 @@ EOS
   # @return [Worker]
   def worker(options={})
     return Worker.new(@redis, options)
+  end
+
+  # Generates a random lock identifier (used internally).
+  #
+  # @return [String]
+  def self.generate_lock_id
+    "#{SecureRandom.uuid}/#{Process.pid}"
   end
 
   # Returns full name of queue with given id.

@@ -133,7 +133,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
   test "should push dispatching events atomically on dispatcher creation" do
     redis = mock
-    redis.expects(:script).returns("678")
+    redis.expects(:script).twice.returns("678", "456")
     redis.expects(:evalsha).with("678", ['events:dispatching', 'events:queue'])
     redis.stubs(:set)
 
@@ -143,7 +143,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
   test "should not create dispatcher twice" do
     redis = mock
-    redis.expects(:script).once.returns("678")
+    redis.expects(:script).twice.returns("678", "456")
     redis.expects(:evalsha).once.
       with("678", ['events:dispatching', 'events:queue'])
     redis.stubs(:set)
@@ -157,10 +157,12 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
 
-    dispatcher.dispatch_all do |event|
+    result = dispatcher.dispatch_all do |event|
       assert_equal({ 'id' => 1 }, event)
       [10, 500]
     end
+    assert_equal(true, result)
+    assert_nil(@redis.get("events:lock"))
 
     assert_equal(["10"], @redis.smembers("queues:known"))
 
@@ -468,6 +470,36 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
     assert_equal([{ "data" => { "id" => 1 }, "object" => 300 }.to_json],
       @redis.lrange("queues:30:events", 0, -1))
+  end
+
+  test "should not dispatch if queue is locked" do
+    dispatcher = @processor.dispatcher
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+    @redis.set("events:lock", "123")
+
+    result = dispatcher.dispatch_all do |event|
+      assert_equal({ 'id' => 1 }, event)
+      [10, 100]
+    end
+    assert_equal(false, result)
+
+    assert_equal([{ "id" => 1 }.to_json], @redis.lrange("events:queue", 0, -1))
+    assert_equal([], @redis.lrange("queues:10:events", 0, -1))
+    assert_equal("123", @redis.get("events:lock"))
+  end
+
+  test "should set dispatcher lock" do
+    dispatcher = @processor.dispatcher
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+    assert_throws(:interrupt) do
+      dispatcher.dispatch_all { throw :interrupt }
+    end
+
+    assert_match(/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}\/#{Process.pid}$/,
+      @redis.get("events:lock"))
+    assert_in_delta(300_000, @redis.pttl("events:lock"), 100)
   end
 
   # ----- worker unit tests -----
