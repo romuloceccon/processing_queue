@@ -462,6 +462,14 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal([], @redis.lrange("queues:waiting", 0, -1))
   end
 
+  test "should post out-of-band event" do
+    dispatcher = @processor.dispatcher
+    dispatcher.post({ "id" => 1 }, 30, 300)
+
+    assert_equal([{ "data" => { "id" => 1 }, "object" => 300 }.to_json],
+      @redis.lrange("queues:30:events", 0, -1))
+  end
+
   # ----- worker unit tests -----
 
   test "should get operator from queue" do

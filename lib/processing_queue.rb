@@ -337,17 +337,34 @@ EOS
 
       abandoned_queues = find_abandoned_queues
 
-      # Retry until multi succeeds
-      loop do
-        @redis.watch(SUSPENDED_QUEUES_SET)
-        suspended = @redis.smembers(SUSPENDED_QUEUES_SET)
-
+      transaction do |suspended|
         # Enqueue events and delete temporary queue atomically
-        break if @redis.multi do
-          seen_queues = enqueue_events(list, suspended) + suspended
-          enqueue_abandoned_queues(abandoned_queues, seen_queues)
-          @redis.del(DISPATCHING_EVENTS_LIST)
-        end
+        seen_queues = enqueue_events(list, suspended) + suspended
+        enqueue_abandoned_queues(abandoned_queues, seen_queues)
+        @redis.del(DISPATCHING_EVENTS_LIST)
+      end
+    end
+
+    # Append event directly to its {ProcessingQueue.queue_events_list}.
+    #
+    # One can use {#post} to append an event whose queue_id and object are known
+    # directly to its {ProcessingQueue.queue_events_list}. That avoids the
+    # overhead of pushing the event into the {ProcessingQueue.INITIAL_QUEUE} and
+    # parsing it later through the dispatcher.
+    #
+    # Of course it's only available inside the application dispatching and/or
+    # processing the events, but is useful in scenarios with "out-of-band"
+    # events (e.g. the dispatcher wants to post additional events based on the
+    # sequence of events posted to {ProcessingQueue.INITIAL_QUEUE}).
+    #
+    # @param [Object] data The event data
+    # @param [String] queue_id Queue name
+    # @param [Object] object Object to attach to event (see {#dispatch_all})
+    # @return [nil]
+    def post(data, queue_id, object=nil)
+      transaction do |suspended|
+        list = [[queue_id, object, data]]
+        enqueue_events(list, suspended)
       end
     end
 
@@ -419,6 +436,15 @@ EOS
         else
           @redis.rpop(PROCESSING_QUEUES_LIST)
         end
+      end
+    end
+
+    def transaction(&block)
+      # Retry until multi succeeds
+      loop do
+        @redis.watch(SUSPENDED_QUEUES_SET)
+        suspended = @redis.smembers(SUSPENDED_QUEUES_SET)
+        break if @redis.multi { yield(suspended) }
       end
     end
   end
