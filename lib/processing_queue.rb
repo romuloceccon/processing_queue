@@ -1,6 +1,7 @@
 require 'redis'
 require 'json'
 require 'securerandom'
+require 'timeout'
 
 # Queue to process events sequentially among multiple workers.
 #
@@ -107,6 +108,7 @@ require 'securerandom'
 #     end
 class ProcessingQueue
   LOCK_TIMEOUT = 300_000
+  EXEC_TIMEOUT = LOCK_TIMEOUT / 2_000
   DEFAULT_BATCH_SIZE = 100
 
   PERF_COUNTER_RESOLUTION = 5  # 5 seconds
@@ -354,23 +356,26 @@ EOS
         return false
       end
 
-      if @redis.exists(INITIAL_QUEUE)
-        # Process queue safely: move master queue to a temporary one that won't
-        # be touched by the workers. If this instance crashes the temporary
-        # queue will be merged again to the master (see {ProcessingQueue#dispatcher}).
-        @redis.rename(INITIAL_QUEUE, DISPATCHING_EVENTS_LIST)
-        list = prepare_events(DISPATCHING_EVENTS_LIST, &block)
-      else
-        list = []
-      end
+      Timeout.timeout(EXEC_TIMEOUT) do
+        if @redis.exists(INITIAL_QUEUE)
+          # Process queue safely: move master queue to a temporary one that
+          # won't be touched by the workers. If this instance crashes the
+          # temporary queue will be merged again to the master (see
+          # {ProcessingQueue#dispatcher}).
+          @redis.rename(INITIAL_QUEUE, DISPATCHING_EVENTS_LIST)
+          list = prepare_events(DISPATCHING_EVENTS_LIST, &block)
+        else
+          list = []
+        end
 
-      abandoned_queues = find_abandoned_queues
+        abandoned_queues = find_abandoned_queues
 
-      transaction do |suspended|
-        # Enqueue events and delete temporary queue atomically
-        seen_queues = enqueue_events(list, suspended) + suspended
-        enqueue_abandoned_queues(abandoned_queues, seen_queues)
-        @redis.del(DISPATCHING_EVENTS_LIST)
+        transaction do |suspended|
+          # Enqueue events and delete temporary queue atomically
+          seen_queues = enqueue_events(list, suspended) + suspended
+          enqueue_abandoned_queues(abandoned_queues, seen_queues)
+          @redis.del(DISPATCHING_EVENTS_LIST)
+        end
       end
 
       @redis.evalsha(@unlock_script, [EVENTS_LOCK], [@lock_id])
@@ -576,7 +581,11 @@ EOS
     # be kept untouched to be processed again later.
     #
     # {#process} finishes cleaning-up the queue and releasing the lock by
-    # calling {ProcessingQueue.LUA_CLEAN_AND_UNLOCK}.
+    # calling {ProcessingQueue.LUA_CLEAN_AND_UNLOCK}. If the whole operation
+    # takes longer than {ProcessingQueue.EXEC_TIMEOUT} (which is set to half the
+    # length of {ProcessingQueue.LOCK_TIMEOUT}) it's aborted to prevent another
+    # instance from arriving after {ProcessingQueue.LOCK_TIMEOUT} expires and
+    # messing with our internal state.
     #
     # ### Performance counters
     #
@@ -607,24 +616,26 @@ EOS
           return false
         end
 
-        performance = Performance.new(@redis, @inc_counter_script)
+        Timeout.timeout(EXEC_TIMEOUT) do
+          performance = Performance.new(@redis, @inc_counter_script)
 
-        cnt = 0
-        enum = Enumerator.new do |y|
-          while !@interrupted && cnt < @max_batch_size &&
-              event = @redis.lindex(queue, -(cnt + 1)) do
-            cnt += 1
-            performance.store(1)
-            y << JSON.parse(event)
+          cnt = 0
+          enum = Enumerator.new do |y|
+            while !@interrupted && cnt < @max_batch_size &&
+                event = @redis.lindex(queue, -(cnt + 1)) do
+              cnt += 1
+              performance.store(1)
+              y << JSON.parse(event)
+            end
           end
-        end
-        yield(enum)
-        performance.store(0)
+          yield(enum)
+          performance.store(0)
 
-        @redis.multi do
-          (1..cnt).each do
-            @redis.rpop(queue)
-            @redis.incr(EVENTS_COUNTERS_PROCESSED)
+          @redis.multi do
+            (1..cnt).each do
+              @redis.rpop(queue)
+              @redis.incr(EVENTS_COUNTERS_PROCESSED)
+            end
           end
         end
 
@@ -651,7 +662,7 @@ EOS
     #    is called.
     #
     # The value passed to exit follows Bash (and other shells) convention, i.e.
-    # the process returns with a status code equal to 128 + <signal number>.
+    # the process returns with a status code equal to `128 + <signal number>`.
     def trap!
       return if @trapped
       @trapped = true
