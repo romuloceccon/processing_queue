@@ -731,7 +731,8 @@ EOS
         @name = queue_id
         @count = redis.llen(ProcessingQueue.queue_events_list(queue_id))
         @suspended = suspended_queues.include?(queue_id)
-        @queued = waiting_queues.include?(queue_id)
+        @queue_pos = waiting_queues.rindex(queue_id)
+        @queue_pos &&= waiting_queues.size - @queue_pos - 1
         @processing = processing_queues.include?(queue_id)
         @locked_by = @ttl = nil
 
@@ -746,8 +747,8 @@ EOS
         !!@locked_by
       end
 
-      def queued?
-        @queued
+      def queue_pos
+        @queue_pos
       end
 
       def suspended?

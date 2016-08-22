@@ -150,7 +150,7 @@ class ProcessingQueue::Monitor
       add_col(0, 1, 'SIZE', true)
       add_col(0, 2, 'WORKER', true)
       add_col(0, 3, 'TTL', true)
-      add_col(0, 4, 'QUEUED?')
+      add_col(0, 4, 'Q.POS', true)
       add_col(0, 5, 'TAKEN?')
       add_col(0, 6, 'SUSP?')
 
@@ -169,7 +169,7 @@ class ProcessingQueue::Monitor
           add_col(y, 3, queue.ttl, true)
         end
 
-        add_col(y, 4, "   X") if queue.queued?
+        add_col(y, 4, queue.queue_pos.to_s, true) if queue.queue_pos
         add_col(y, 5, "   X") if queue.taken?
         add_col(y, 6, "  X") if queue.suspended?
       end

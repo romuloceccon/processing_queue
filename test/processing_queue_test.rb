@@ -852,7 +852,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
-    assert_false(operator.queued?)
+    assert_nil(operator.queue_pos)
     assert_false(operator.taken?)
   end
 
@@ -864,8 +864,25 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
     assert_false(operator.locked?)
-    assert_true(operator.queued?)
+    assert_equal(0, operator.queue_pos)
     assert_false(operator.taken?)
+  end
+
+  test "should get position of multiple queued operators" do
+    ['3', '2', '1'].each do |x|
+      @redis.sadd("queues:known", x)
+      @redis.lpush("queues:waiting", x)
+    end
+    # should consider only first entry if operator was queued twice
+    @redis.lpush("queues:waiting", '3')
+
+    @statistics = ProcessingQueue::Statistics.new(@redis)
+    assert_equal(3, @statistics.queues.count)
+
+    [[2, '1'], [1, '2'], [0, '3']].each_with_index do |(pos, name), i|
+      assert_equal(name, @statistics.queues[i].name)
+      assert_equal(pos, @statistics.queues[i].queue_pos)
+    end
   end
 
   test "should get suspended operator status" do
@@ -885,7 +902,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(1, @statistics.queues.count)
     operator = @statistics.queues.first
     assert_false(operator.locked?)
-    assert_false(operator.queued?)
+    assert_nil(operator.queue_pos)
     assert_true(operator.taken?)
   end
 
