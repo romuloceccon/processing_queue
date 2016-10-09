@@ -12,7 +12,6 @@ Gem::Specification.new do |s|
   s.license     = 'Nonstandard'
 
   s.add_runtime_dependency 'curses', ['~> 1.0']
-  s.add_runtime_dependency 'json', ['~> 1.0']
   s.add_runtime_dependency 'redis', ['~> 3.0']
 
   s.add_development_dependency 'mocha', ['~> 1.0']
