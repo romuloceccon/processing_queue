@@ -879,7 +879,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
     @statistics = ProcessingQueue::Statistics.new(@redis)
     assert_equal(3, @statistics.queues.count)
 
-    [[2, '1'], [1, '2'], [0, '3']].each_with_index do |(pos, name), i|
+    [[0, '3'], [1, '2'], [2, '1']].each_with_index do |(pos, name), i|
       assert_equal(name, @statistics.queues[i].name)
       assert_equal(pos, @statistics.queues[i].queue_pos)
     end
@@ -950,27 +950,41 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal(['+11', '10', 'a', '{c}'], @statistics.queues.map(&:name))
   end
 
-  test "should sort operators by queue length" do
+  test "should sort operators by queue position" do
     @redis.sadd("queues:known", '+11')
     @redis.sadd("queues:known", '10')
     @redis.sadd("queues:known", 'a')
-    @redis.lpush("queues:a:events", 'a')
+    @redis.lpush("queues:waiting", 'a')
+    @redis.lpush("queues:waiting", '10')
     @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queues.count)
-    assert_equal(['a', '+11', '10'], @statistics.queues.map(&:name))
+    assert_equal(['a', '10', '+11'], @statistics.queues.map(&:name))
   end
 
   test "should sort operators by lock status" do
     @redis.sadd("queues:known", '+11')
     @redis.sadd("queues:known", '10')
     @redis.sadd("queues:known", 'a')
-    @redis.lpush("queues:a:events", 'a')
+    @redis.lpush("queues:waiting", 'a')
     @redis.set("queues:10:lock", '123/123')
     @statistics = ProcessingQueue::Statistics.new(@redis)
 
     assert_equal(3, @statistics.queues.count)
     assert_equal(['10', 'a', '+11'], @statistics.queues.map(&:name))
+  end
+
+  test "should sort operators by locker pid" do
+    @redis.sadd("queues:known", '+11')
+    @redis.sadd("queues:known", '10')
+    @redis.sadd("queues:known", 'a')
+    @redis.set("queues:10:lock", 'abcd/1001')
+    @redis.set("queues:a:lock", 'abcd/101')
+    @redis.lpush("queues:waiting", '10')
+    @statistics = ProcessingQueue::Statistics.new(@redis)
+
+    assert_equal(3, @statistics.queues.count)
+    assert_equal(['a', '10', '+11'], @statistics.queues.map(&:name))
   end
 
   test "should sort operators by suspend state" do

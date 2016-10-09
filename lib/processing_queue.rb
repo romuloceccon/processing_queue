@@ -760,9 +760,13 @@ EOS
       end
 
       def <=>(other)
-        return suspended? ? -1 : 1 if suspended? != other.suspended?
-        return locked? ? -1 : 1 if locked? != other.locked?
-        return other.count <=> count if count != other.count
+        return suspended? ? -1 : 1 if suspended? ^ other.suspended?
+        return locked? ? -1 : 1 if locked? ^ other.locked?
+        return locked_by.to_i <=> other.locked_by.to_i if locked_by \
+          && other.locked_by && locked_by != other.locked_by
+        return queue_pos ? -1 : 1 if !queue_pos ^ !other.queue_pos
+        return queue_pos <=> other.queue_pos if queue_pos && other.queue_pos \
+          && queue_pos != other.queue_pos
         return name <=> other.name
       end
     end
