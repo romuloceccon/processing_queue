@@ -110,30 +110,10 @@ class ProcessingQueue
   LOCK_TIMEOUT = 300_000
   EXEC_TIMEOUT = LOCK_TIMEOUT / 2_000
   DEFAULT_BATCH_SIZE = 100
+  DISPATCHER_BATCH_SIZE = 100
 
   PERF_COUNTER_RESOLUTION = 5  # 5 seconds
   PERF_COUNTER_HISTORY = 900   # 15 minutes
-
-  # @!method LUA_JOIN_LISTS([dispatching_list, events_list])
-  # @!scope class
-  #
-  # Merge dispatching list into events list.
-  #
-  # All events in `dispatching_list` will be taken in reverse order and pushed
-  # back to `events_list`, such that the events (a) appear in the order they
-  # were initially found before being moved to `dispatching_list` and (b) are
-  # placed _before_ current events in `events_list`.
-  #
-  # @param [String] dispatching_list Name of temporary event list
-  # @param [String] events_list Name of initial event list
-  # @return [nil]
-  LUA_JOIN_LISTS = <<EOS.freeze
-while true do
-  local val = redis.call('LPOP', KEYS[1])
-  if not val then return end
-  redis.call('RPUSH', KEYS[2], val)
-end
-EOS
 
   # @!method LUA_CLEAN_AND_UNLOCK([lock, known_queues, suspended_queues, waiting_queues, events_list], [lock_id, queue])
   # @!scope class
@@ -236,7 +216,6 @@ if not exists then redis.call("EXPIRE", KEYS[1], ARGV[2]) end
 EOS
 
   INITIAL_QUEUE = "events:queue".freeze
-  DISPATCHING_EVENTS_LIST = "events:dispatching".freeze
   EVENTS_LOCK = "events:lock".freeze
 
   EVENTS_COUNTERS_DISPATCHED = "events:counters:dispatched".freeze
@@ -253,18 +232,11 @@ EOS
   # at {ProcessingQueue.INITIAL_QUEUE} and place them at the appropriate
   # {ProcessingQueue.queue_events_list}.
   #
-  # It has a safety mechanism in case of a sudden crash: before starting the
-  # actual dispatch the list being pre-processed is moved to a temporary one.
-  # If no error occurs the temporary list is then removed; otherwise, upon
-  # restart, the dispatcher checks for an existing temporary list and merges it
-  # into the {ProcessingQueue.INITIAL_QUEUE} before starting the actual dispatch
-  # loop.
-  #
-  # Another important feature is the clean-up of abandoned worker queues. If a
-  # worker crashes it's going to leave o Redis lock behind, preventing other
-  # workers to work on the same queue. At every iteration the dispatcher will
-  # check for expired locks and reschedule the corresponding queue so that
-  # another worker can work on it.
+  # An important feature is the clean-up of abandoned worker queues. If a worker
+  # crashes it's going to leave o Redis lock behind, preventing other workers to
+  # work on the same queue. At every iteration the dispatcher will check for
+  # expired locks and reschedule the corresponding queue so that another worker
+  # can work on it.
   #
   # See {ProcessingQueue} for usage example.
   class Dispatcher
@@ -292,35 +264,49 @@ EOS
     #
     # ## Internals
     #
-    # Dispatching starts by moving an existing {ProcessingQueue.INITIAL_QUEUE}
-    # to a {ProcessingQueue.DISPATCHING_EVENTS_LIST}. They are then yielded in
+    # Dispatching starts by (a) copying the first
+    # {ProcessingQueue.DISPATCHER_BATCH_SIZE} events from
+    # {ProcessingQueue.INITIAL_QUEUE} into memory. They are then (b) yielded in
     # sequence to the block given to get their queue names and attached objects.
     #
-    # {ProcessingQueue.KNOWN_QUEUES_SET} and
-    # {ProcessingQueue.PROCESSING_QUEUES_LIST} will be checked to find out
-    # whether any worker has crashed, leaving a lock behind: if the queue name
-    # appears in _both_ lists and no lock exists (meaning the corresponding lock
-    # key has expired) it's considered to be abandoned.
+    # Next, (c) an _atomic_ operation starts, i.e. it's not suscetible to any
+    # kind of race condition with the workers:
     #
-    # Next, an _atomic_ operation starts, i.e. it's not suscetible to any kind
-    # of race condition with the workers:
-    #
-    # * for each event:
+    # * for each one of the N events:
     #   * the queue name is added to the {ProcessingQueue.KNOWN_QUEUES_SET}
     #   * the queue name is appended to the
     #     {ProcessingQueue.WAITING_QUEUES_LIST}
     #   * the event is appended to its {ProcessingQueue.queue_events_list}
+    # * N events are `RPOP`'ed from {ProcessingQueue.INITIAL_QUEUE}
+    #
+    # The above process -- (a) through (c) -- reapeats by copying the next
+    # {ProcessingQueue.DISPATCHER_BATCH_SIZE} events into memory, until
+    # {ProcessingQueue.INITIAL_QUEUE} is empty.
+    #
+    # The transaction guarantees that events are removed from the
+    # {ProcessingQueue.INITIAL_QUEUE} only after they have been
+    # successfully appended to their respective queues. If the process crashes
+    # during dispatch the next time it starts it's going to see the same events
+    # it saw before the crash.
+    #
+    # When {ProcessingQueue.INITIAL_QUEUE} becomes empty
+    # {ProcessingQueue.KNOWN_QUEUES_SET} and
+    # {ProcessingQueue.PROCESSING_QUEUES_LIST} will be checked to find out
+    # whether any worker has crashed, leaving a lock behind: if the queue name
+    # appears in _both_ lists and no lock exists (meaning the corresponding lock
+    # key has expired) it's considered to be abandoned. The whole operation is
+    # performed in two steps:
+    #
     # * the names of abandoned queues are appended to
     #   {ProcessingQueue.WAITING_QUEUES_LIST}
     # * names of empty queues _which are not currently locked_ are removed from
     #   {ProcessingQueue.PROCESSING_QUEUES_LIST}
-    # * temporary list {ProcessingQueue.DISPATCHING_EVENTS_LIST} is removed
     #
     # Note that, because of the nature of Redis "multi" transactions, we cannot
     # retrieve values after the transaction starts. Therefore, we are limited to
-    # only _send_ commands. That affects how abandonded queues are managed,
+    # only _sending_ commands. That affects how abandonded queues are managed,
     # because we must avoid the race condition which exists between starting the
-    # check and starting the transaction when events are pushed.
+    # check and moving data between collections.
     #
     # The dispatcher is the only process which _removes_ items from
     # {ProcessingQueue.PROCESSING_QUEUES_LIST}, while the workers can only
@@ -336,14 +322,6 @@ EOS
     # by the fact that `RPOPLPUSH`'ed items will appear _after_ the newly
     # appended item.
     #
-    # The transaction guarantees that events are removed from the
-    # {ProcessingQueue.DISPATCHING_EVENTS_LIST} only after they have been
-    # successfully appended to their respective queues. If the process crashes
-    # during dispatch it's going to leave a non-empty
-    # {ProcessingQueue.DISPATCHING_EVENTS_LIST} behind. Upon restart
-    # {ProcessingQueue#dispatcher} will look for it and merge it back with
-    # {ProcessingQueue.INITIAL_QUEUE}.
-    #
     # If some queue was suspended by {ProcessingQueue#suspend_queue} everything
     # will continue to work as before, except such queue name won't ever be
     # appended to {ProcessingQueue.WAITING_QUEUES_LIST} (thus not becoming
@@ -352,34 +330,11 @@ EOS
     # The whole operation is further protected with a Redlock (see
     # {ProcessingQueue::LUA_UNLOCK}).
     def dispatch_all(&block)
-      unless @redis.set(EVENTS_LOCK, @lock_id, nx: true, px: LOCK_TIMEOUT)
-        return false
+      loop do
+        result = dispatch_batch(&block)
+        return false unless result
+        return true if result == 0
       end
-
-      Timeout.timeout(EXEC_TIMEOUT) do
-        if @redis.exists(INITIAL_QUEUE)
-          # Process queue safely: move master queue to a temporary one that
-          # won't be touched by the workers. If this instance crashes the
-          # temporary queue will be merged again to the master (see
-          # {ProcessingQueue#dispatcher}).
-          @redis.rename(INITIAL_QUEUE, DISPATCHING_EVENTS_LIST)
-          list = prepare_events(DISPATCHING_EVENTS_LIST, &block)
-        else
-          list = []
-        end
-
-        abandoned_queues = find_abandoned_queues
-
-        transaction do |suspended|
-          # Enqueue events and delete temporary queue atomically
-          seen_queues = enqueue_events(list, suspended) + suspended
-          enqueue_abandoned_queues(abandoned_queues, seen_queues)
-          @redis.del(DISPATCHING_EVENTS_LIST)
-        end
-      end
-
-      @redis.evalsha(@unlock_script, [EVENTS_LOCK], [@lock_id])
-      true
     end
 
     # Append event directly to its {ProcessingQueue.queue_events_list}.
@@ -407,11 +362,37 @@ EOS
 
     private
 
-    def prepare_events(list)
-      cnt = @redis.llen(list)
+    def dispatch_batch(&block)
+      unless @redis.set(EVENTS_LOCK, @lock_id, nx: true, px: LOCK_TIMEOUT)
+        return false
+      end
 
-      (1..cnt).map do |i|
-        json = @redis.lindex(list, -i)
+      result = nil
+
+      Timeout.timeout(EXEC_TIMEOUT) do
+        events = @redis.lrange(INITIAL_QUEUE, -DISPATCHER_BATCH_SIZE, -1)
+        result = events.size
+
+        if result == 0
+          abandoned_queues = find_abandoned_queues
+          transaction do |suspended|
+            enqueue_abandoned_queues(abandoned_queues, suspended)
+          end
+        else
+          list = prepare_events(events, &block)
+          transaction do |suspended|
+            enqueue_events(list, suspended)
+            result.times { @redis.rpop(INITIAL_QUEUE) }
+          end
+        end
+      end
+
+      @redis.evalsha(@unlock_script, [EVENTS_LOCK], [@lock_id])
+      result
+    end
+
+    def prepare_events(list)
+      list.reverse.map do |json|
         data = JSON.parse(json)
         queue_id, object = yield(data)
         [queue_id, object, data]
@@ -854,7 +835,6 @@ EOS
   def initialize(redis)
     @redis = redis
     @dispatcher = nil
-    @join_script = @redis.script('LOAD', LUA_JOIN_LISTS)
   end
 
   # Creates a dispatcher.
@@ -866,7 +846,6 @@ EOS
   def dispatcher
     return @dispatcher if @dispatcher
 
-    @redis.evalsha(@join_script, [DISPATCHING_EVENTS_LIST, INITIAL_QUEUE])
     @dispatcher = Dispatcher.new(@redis)
   end
 

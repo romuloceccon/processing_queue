@@ -76,17 +76,17 @@ class ProcessingQueueTest < Test::Unit::TestCase
     wrapper = Wrapper.new(@redis)
     dispatcher = ProcessingQueue.new(wrapper).dispatcher
 
-    before, after = nil, nil
+    before, after = [], []
 
-    wrapper.before(:rename) { |*args| before = @redis.exists("events:dispatching") }
-    wrapper.after(:rename) { |*args| after = @redis.exists("events:dispatching") }
+    wrapper.before(:set) { |*args| before << @redis.exists("events:lock") }
+    wrapper.after(:set) { |*args| after << @redis.exists("events:lock") }
 
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
 
     dispatcher.dispatch_all { [1, 1] }
 
-    assert_equal(false, before)
-    assert_equal(true, after)
+    assert_equal([false, false], before)
+    assert_equal([true, true], after)
   end
 
   # ----- dispatcher unit tests -----
@@ -105,51 +105,12 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal("456", @redis.get("events:counters:processed"))
   end
 
-  test "should append dispatching events to queue on dispatcher creation" do
-    @redis.lpush("events:dispatching", "1")
-
-    @processor.dispatcher
-    assert_equal(false, @redis.exists("events:dispatching"))
-    assert_equal("1", @redis.rpop("events:queue"))
-  end
-
-  test "should not overwrite events in queue on dispatcher creation" do
-    @redis.lpush("events:dispatching", "1")
-    @redis.lpush("events:dispatching", "2")
-    @redis.lpush("events:queue", "3")
-
-    @processor.dispatcher
-    assert_equal(3, @redis.llen("events:queue"))
-  end
-
-  test "should push dispatching events before queue on dispatcher creation" do
-    @redis.lpush("events:dispatching", "1")
-    @redis.lpush("events:dispatching", "2")
-    @redis.lpush("events:queue", "3")
-
-    @processor.dispatcher
-    (1..3).each { |i| assert_equal(i.to_s, @redis.rpop("events:queue")) }
-  end
-
-  test "should push dispatching events atomically on dispatcher creation" do
-    redis = mock
-    redis.expects(:script).twice.returns("678", "456")
-    redis.expects(:evalsha).with("678", ['events:dispatching', 'events:queue'])
-    redis.stubs(:set)
-
-    p = ProcessingQueue.new(redis)
-    p.dispatcher
-  end
-
   test "should not create dispatcher twice" do
     redis = mock
-    redis.expects(:script).twice.returns("678", "456")
-    redis.expects(:evalsha).once.
-      with("678", ['events:dispatching', 'events:queue'])
-    redis.stubs(:set)
+    redis.expects(:script).once.returns("678")
 
     p = ProcessingQueue.new(redis)
-    assert_equal(p.dispatcher, p.dispatcher)
+    assert_same(p.dispatcher, p.dispatcher)
   end
 
   test "should dispatch single event" do
@@ -289,9 +250,9 @@ class ProcessingQueueTest < Test::Unit::TestCase
       end
     end
 
+    assert_equal(3, @redis.llen("events:queue"))
     assert_equal(false, @redis.exists("queues:known"))
-    assert_equal(0, @redis.llen("events:queue"))
-    assert_equal(3, @redis.llen("events:dispatching"))
+    assert_equal(false, @redis.exists("queues:20:events"))
   end
 
   test "should dispatch events atomically" do
@@ -300,14 +261,65 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
     @redis.lpush("events:queue", { 'id' => 1 }.to_json)
 
-    wrapper.before(:del) do |*args|
-      raise Error, 'abort' if args.first == 'events:dispatching'
+    wrapper.after(:incr) do |*args|
+      raise Error, 'abort'
     end
 
     assert_raises(Error) { dispatcher.dispatch_all { [1, 1] } }
 
+    assert_equal(1, @redis.llen("events:queue"))
     assert_equal(0, @redis.llen("queues:waiting"))
     assert_equal(false, @redis.exists("queues:known"))
+  end
+
+  test "should preserve events added during dispatch" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
+
+    @redis.lpush("events:queue", { 'id' => 1 }.to_json)
+
+    redis_aux = Redis.new(db: 15)
+    wrapper.after(:incr) do |*args|
+      redis_aux.lpush("events:queue", { 'id' => 2 }.to_json)
+      # avoid start of second iteration
+      wrapper.before(:set) { throw(:abort) }
+    end
+
+    catch(:abort) { dispatcher.dispatch_all { [1, 1] } }
+
+    assert_equal(1, @redis.llen("events:queue"))
+    assert_equal({ 'id' => 2 }, JSON.parse(@redis.lindex("events:queue", 0)))
+  end
+
+  test "should limit size of dispatched events batch" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
+
+    (1..101).each { |i| @redis.lpush("events:queue", { 'id' => i }.to_json) }
+
+    queue_states = []
+    wrapper.before(:lrange) do |*args|
+      if args.first == "events:queue"
+        queue_states << @redis.lrange("events:queue", 0, -1)
+      end
+    end
+
+    dispatcher.dispatch_all { |ev| [1, ev['id']] }
+
+    k = "queues:1:events"
+    assert_equal(101, @redis.llen(k))
+    assert_equal(1, JSON.parse(@redis.lindex(k, -1))['object'])
+    assert_equal(101, JSON.parse(@redis.lindex(k, 0))['object'])
+
+    assert_equal(3, queue_states.size)
+
+    assert_equal(101, queue_states[0].size)
+    assert_equal({ 'id' => 1 }, JSON.parse(queue_states[0].last))
+
+    assert_equal(1, queue_states[1].size)
+    assert_equal({ 'id' => 101 }, JSON.parse(queue_states[1].last))
+
+    assert_equal(0, queue_states[2].size)
   end
 
   test "should reenqueue known processing operators at end of queue" do
@@ -325,21 +337,6 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal([], @redis.lrange("queues:processing", 0, -1))
   end
 
-  test "should not reenqueue already enqueued processing operator" do
-    dispatcher = @processor.dispatcher
-
-    @redis.sadd("queues:known", "20")
-    @redis.lpush("queues:processing", "20")
-
-    @redis.lpush("events:queue", { "id" => 2 }.to_json)
-    dispatcher.dispatch_all { [20, 200] }
-
-    assert_equal(["20"], @redis.smembers("queues:known"))
-
-    assert_equal(["20"], @redis.lrange("queues:waiting", 0, -1))
-    assert_equal([], @redis.lrange("queues:processing", 0, -1))
-  end
-
   test "should reenqueue known processing operators even without events" do
     dispatcher = @processor.dispatcher
 
@@ -352,6 +349,32 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal("20", @redis.rpop("queues:waiting"))
 
     assert_equal(0, @redis.llen("queues:processing"))
+  end
+
+  test "should not reenqueue known processing operators before final batch" do
+    wrapper = Wrapper.new(@redis)
+    dispatcher = ProcessingQueue.new(wrapper).dispatcher
+
+    (1..101).each { |i| @redis.lpush("events:queue", { 'id' => i }.to_json) }
+
+    @redis.sadd("queues:known", "10")
+    @redis.lpush("queues:processing", "10")
+
+    known_operators_states = []
+    wrapper.before(:lrange) do |*args|
+      if args.first == "events:queue"
+        known_operators_states << @redis.lrange("queues:waiting", 0, -1)
+      end
+    end
+
+    dispatcher.dispatch_all { [0, 0] }
+
+    assert_equal(["10", "0", "0"], @redis.lrange("queues:waiting", 0, -1))
+
+    assert_equal(3, known_operators_states.size)
+    assert_equal([], known_operators_states[0])
+    assert_equal(["0"], known_operators_states[1])
+    assert_equal(["0", "0"], known_operators_states[2])
   end
 
   test "should not reenqueue unknown processing operators" do
@@ -376,8 +399,10 @@ class ProcessingQueueTest < Test::Unit::TestCase
     @redis.sadd("queues:known", "20")
 
     redis_aux = Redis.new(db: 15)
-    wrapper.before(:sadd) do |*args|
-      redis_aux.lpush("queues:processing", "20")
+    wrapper.before(:exists) do |*args|
+      if args.first == "queues:10:lock"
+        redis_aux.lpush("queues:processing", "20")
+      end
     end
 
     @redis.lpush("queues:processing", "10")
