@@ -588,6 +588,54 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal("2", @redis.get("events:counters:processed"))
   end
 
+  test "should yield events multiple times and increment processed event counter only once" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
+
+    processed = []
+
+    worker.process("1") do |events|
+      events.each { |ev| processed << ev }
+      events.each { |ev| processed << ev }
+    end
+
+    assert_equal(4, processed.size)
+    [0, 2].each { |i| assert_equal({ 'val' => 1 }, processed[i]) }
+    [1, 3].each { |i| assert_equal({ 'val' => 2 }, processed[i]) }
+
+    assert_equal("2", @redis.get("events:counters:processed"))
+  end
+
+  test "should remove only events iterated through the last time during multiple yields" do
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
+
+    processed = []
+
+    worker.process("1") do |events|
+      events.each { |ev| processed << ev }
+      events.each { |ev| processed << ev; break if ev['val'] == 1 }
+    end
+
+    assert_equal(3, processed.size)
+    assert_equal("1", @redis.get("events:counters:processed"))
+
+    processed = []
+    worker.process("1") do |events|
+      events.each { |ev| processed << ev }
+    end
+
+    assert_equal(1, processed.size)
+    assert_equal({ 'val' => 2 }, processed[0])
+    assert_equal("2", @redis.get("events:counters:processed"))
+  end
+
   test "should lock operator before processing" do
     worker = @processor.worker
 

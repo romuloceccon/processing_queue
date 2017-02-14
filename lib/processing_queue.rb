@@ -548,6 +548,15 @@ EOS
     # transactions to complete (or, in case the transaction is almost finished,
     # rolling back previously processed events).
     #
+    # It's also possible to iterate through the enumerator multiple times, for
+    # example, to retry a database transaction after it deadlocks. The event
+    # batch is yielded in the same order each time iteration starts on the
+    # enumeration. _Important:_ in such a scenario if one stops iterating by
+    # `break`ing from the enumeration only the events iterated through during
+    # the last time will be removed from the queue, i.e. the caller must thus
+    # guarantee any effects of iterating through the events are rolled back
+    # before the last time iteration starts.
+    #
     # ## Internals
     #
     # First the worker tries to set an exclusive {ProcessingQueue.queue_lock} on
@@ -609,6 +618,7 @@ EOS
 
           cnt = 0
           enum = Enumerator.new do |y|
+            cnt = 0
             while !@interrupted && cnt < @max_batch_size &&
                 event = @redis.lindex(queue, -(cnt + 1)) do
               cnt += 1
