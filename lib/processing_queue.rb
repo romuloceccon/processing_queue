@@ -680,20 +680,27 @@ EOS
     def initialize(redis, script)
       @redis = redis
       @script = script
-      @previous = get_time
+      @previous = ProcessingQueue.get_time
+      @delta = ProcessingQueue.redis_epoch(redis) - @previous
     end
 
     # Add time and count to performance counters.
     #
     # Current slot id is determined by dividing the current time (as given by
-    # the monotonic process clock) by the slot width. `count` and the time since
-    # the last call (or object initialization) is then added to the current
-    # slot.
+    # the monotonic process clock and the previously calculated difference to
+    # the time at the server) by the slot width. `count` and the time since the
+    # last call (or object initialization) is then added to the current slot.
+    #
+    # Note that the server time is checked only once; thus, the algorithm
+    # assumes there'll be no relative drift between the server time and the
+    # local monotonic clock. Also, sentinels with different times are not (yet)
+    # handled by the algorithm; in that case the behavior of the counters will
+    # be undefined.
     def store(count)
-      t = get_time
+      t = ProcessingQueue.get_time
       diff, @previous = t - @previous, t
 
-      slot = (t / PERF_COUNTER_RESOLUTION).to_i
+      slot = ((t + @delta) / PERF_COUNTER_RESOLUTION).to_i
       time_counter = "events:counters:#{slot}:time"
       cnt_counter = "events:counters:#{slot}:count"
 
@@ -702,10 +709,6 @@ EOS
     end
 
     private
-
-    def get_time
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
 
     def update_counter(counter, val)
       return if val <= 0
@@ -786,6 +789,7 @@ EOS
 
     def initialize(redis)
       @redis = redis
+      @delta = ProcessingQueue.redis_epoch(redis) - ProcessingQueue.get_time
       update
     end
 
@@ -815,7 +819,7 @@ EOS
       @waiting_count = @queues.inject(0) { |r, obj| r + obj.count }
 
       res = PERF_COUNTER_RESOLUTION
-      t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      t = ProcessingQueue.get_time + @delta
       cur_slot = (t / res).to_i
       slot_cnt = (900 / res).to_i
 
@@ -930,5 +934,20 @@ EOS
   # @return [String]
   def self.queue_lock(id)
     "queues:#{id}:lock"
+  end
+
+  # Returns Unix epoch at the Redis server.
+  #
+  # @return [Float]
+  def self.redis_epoch(redis)
+    secs, usecs = redis.call('TIME').map(&:to_i)
+    secs + 1.0 * usecs / 1e6
+  end
+
+  # Returns the current time from the local monotonic clock.
+  #
+  # @return [Float]
+  def self.get_time
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
   end
 end

@@ -56,6 +56,10 @@ class ProcessingQueueTest < Test::Unit::TestCase
     (t / ProcessingQueue::PERF_COUNTER_RESOLUTION).to_i
   end
 
+  def epoch_to_redis_time(t)
+    (t * 1e6).divmod(1e6).map { |x| x.to_i.to_s }
+  end
+
   # ----- test framework tests -----
 
   test "should cleanup database" do
@@ -636,6 +640,72 @@ class ProcessingQueueTest < Test::Unit::TestCase
     assert_equal("2", @redis.get("events:counters:processed"))
   end
 
+  test "should increment statistical counters after processing" do
+    res = ProcessingQueue::PERF_COUNTER_RESOLUTION
+
+    # Worker is going to call get_time 4 times (once in the beginning, once for
+    # each event, once in the end), totalling 70% of one slot time.
+    times = [0.0, 0.1, 0.3, 0.7].map { |x| res * (100 + x) }
+    ProcessingQueue.expects(:get_time).times(4).returns(*times)
+
+    # Server time is exactly 400 slots (500 - 100) ahead of client
+    t = epoch_to_redis_time(res * (500 + 0.0))
+    @redis.expects(:call).with('TIME').returns(t)
+
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    # Should have counted 2 events and 70% of a slot time
+    assert_in_delta(0.7 * res, @redis.get("events:counters:500:time"), 1e-6)
+    assert_equal("2", @redis.get("events:counters:500:count"))
+
+    # Worker is going to call get_time 3 times, totalling 20% of one slot time.
+    times = [0.5, 0.7, 0.7].map { |x| res * (100 + x) }
+    ProcessingQueue.expects(:get_time).times(3).returns(*times)
+
+    t = epoch_to_redis_time(res * (500 + 0.5))
+    @redis.expects(:call).with('TIME').returns(t)
+
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    # Should have counted a total of 3 events and 90% of a slot time
+    assert_in_delta(0.9 * res, @redis.get("events:counters:500:time"), 1e-6)
+    assert_equal("3", @redis.get("events:counters:500:count"))
+  end
+
+  test "should increment statistical counters with fractional redis epoch" do
+    res = ProcessingQueue::PERF_COUNTER_RESOLUTION
+
+    t = epoch_to_redis_time(res * 500 - 2e-6)
+    @redis.expects(:call).with('TIME').returns(t)
+
+    # first event ends at the last milisecond of the first slot; second event
+    # ends at the first milisecond of the second slot
+    times = [1_000.0, 1_000.000_001, 1_000.000_002, 1_000.000_002]
+    ProcessingQueue.expects(:get_time).times(4).returns(*times)
+
+    worker = @processor.worker
+
+    @redis.sadd("queues:known", "1")
+    @redis.lpush("queues:1:events", { 'val' => 1 }.to_json)
+    @redis.lpush("queues:1:events", { 'val' => 2 }.to_json)
+
+    worker.process("1") { |events| events.each {} }
+
+    assert_equal("1", @redis.get("events:counters:499:count"))
+    assert_equal("1", @redis.get("events:counters:500:count"))
+  end
+
   test "should lock operator before processing" do
     worker = @processor.worker
 
@@ -1104,7 +1174,7 @@ class ProcessingQueueTest < Test::Unit::TestCase
 
   private
     def prepare_event_counter_test(mins, count_per_slot, time_per_slot)
-      t = 100_001
+      t = 100_001.0
       slot = slot_number(t)
       (1..(SLOTS_PER_MIN * mins)).each do |i|
         @redis.set("events:counters:#{slot - i}:count", count_per_slot)
@@ -1122,6 +1192,6 @@ class ProcessingQueueTest < Test::Unit::TestCase
       @redis.set("events:counters:#{slot - (SLOTS_PER_MIN * mins) - 1}:time",
         time_per_slot * 10)
 
-      Process.expects(:clock_gettime).with(Process::CLOCK_MONOTONIC).returns(t)
+      @redis.expects(:call).with('TIME').returns(epoch_to_redis_time(t))
     end
 end
