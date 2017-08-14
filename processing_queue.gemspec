@@ -1,7 +1,7 @@
 Gem::Specification.new do |s|
   s.name        = 'processing_queue'
-  s.version     = '0.3.3'
-  s.date        = '2017-02-14'
+  s.version     = '0.3.4'
+  s.date        = '2017-08-14'
   s.summary     = 'Processing Queue'
   s.description = 'A multi-process work queue backed by Redis'
   s.authors     = ['Rômulo A. Ceccon']
